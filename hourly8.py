@@ -52,7 +52,11 @@ def load_depth_data(uploaded_file):
     Loads and processes the Market Depth data with robust cleaning.
     """
     try:
-        df = pd.read_csv(uploaded_file)
+        # Check the file extension
+        if uploaded_file.name.endswith('.parquet'):
+            df = pd.read_parquet(uploaded_file)
+        else:
+            df = pd.read_csv(uploaded_file)
         df.columns = ['Date', 'Time', 'Ticker', 'Type', 'Price', 'Volume', 'Number_of_Orders']
         
         df['datetime'] = pd.to_datetime(df['Date'] + ' ' + df['Time'], errors='coerce')
@@ -608,7 +612,9 @@ df_sales = None
 df_depth = None
 
 if depth_file:
-    df_depth = load_depth_data(depth_file)
+    with st.spinner('Reading Market Depth... this may take a minute for large files.'):
+        df_depth = load_depth_data(depth_file)
+    st.success('Market Depth Loaded!')
 
 if sales_file:
     trade_date = df_depth['datetime'].iloc[0].date() if df_depth is not None and not df_depth.empty else datetime.date.today()
