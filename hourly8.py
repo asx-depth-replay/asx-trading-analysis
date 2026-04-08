@@ -17,7 +17,16 @@ def load_sales_data(uploaded_file, trade_date):
     Loads and processes the Course of Sales data, aligning it with the trade date from the depth file.
     """
     try:
-        df = pd.read_csv(uploaded_file)
+        # Check if it's Parquet first (Parquet never has encoding errors!)
+        if uploaded_file.name.endswith('.parquet'):
+            df = pd.read_parquet(uploaded_file)
+        else:
+            # TRY CP1252 FIRST (Standard for ASX/Windows CSVs)
+            try:
+                df = pd.read_csv(uploaded_file, encoding='cp1252')
+            except UnicodeDecodeError:
+                # FALLBACK TO LATIN1 if CP1252 fails
+                df = pd.read_csv(uploaded_file, encoding='latin1')
         df.rename(columns={'Price $': 'Price', 'Volume Traded': 'Volume', 'Volume': 'Volume'}, inplace=True)
         
         # Clean numeric columns by removing commas
@@ -52,17 +61,13 @@ def load_depth_data(uploaded_file):
     Loads and processes the Market Depth data with robust cleaning.
     """
     try:
-        # Check the file extension
+        # Check if it's a parquet file first
         if uploaded_file.name.endswith('.parquet'):
             df = pd.read_parquet(uploaded_file)
         else:
-            # TRY CP1252 FIRST (Standard for ASX/Windows CSVs)
-            try:
-                df = pd.read_csv(uploaded_file, encoding='cp1252')
-            except UnicodeDecodeError:
-                # FALLBACK TO LATIN1 if CP1252 fails
-                df = pd.read_csv(uploaded_file, encoding='latin1')
-        df.columns = ['Date', 'Time', 'Ticker', 'Type', 'Price', 'Volume', 'Number_of_Orders']
+            # Existing CSV logic
+            df = pd.read_csv(uploaded_file)
+            df.columns = ['Date', 'Time', 'Ticker', 'Type', 'Price', 'Volume', 'Number_of_Orders']
         
         df['datetime'] = pd.to_datetime(df['Date'] + ' ' + df['Time'], errors='coerce')
         
