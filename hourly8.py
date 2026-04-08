@@ -56,7 +56,12 @@ def load_depth_data(uploaded_file):
         if uploaded_file.name.endswith('.parquet'):
             df = pd.read_parquet(uploaded_file)
         else:
-            df = pd.read_csv(uploaded_file)
+            # TRY CP1252 FIRST (Standard for ASX/Windows CSVs)
+            try:
+                df = pd.read_csv(uploaded_file, encoding='cp1252')
+            except UnicodeDecodeError:
+                # FALLBACK TO LATIN1 if CP1252 fails
+                df = pd.read_csv(uploaded_file, encoding='latin1')
         df.columns = ['Date', 'Time', 'Ticker', 'Type', 'Price', 'Volume', 'Number_of_Orders']
         
         df['datetime'] = pd.to_datetime(df['Date'] + ' ' + df['Time'], errors='coerce')
