@@ -549,8 +549,22 @@ def create_heatmap_fig(depth_df, sales_df):
         st.warning("No data found within the main trading session (10:00 AM - 4:00 PM).")
         return None
 
+    # --- CLOUD-PROOFING START ---
+    # Ensure Volume is a float and strip any hidden formatting/strings
+    def clean_vol(series):
+        if series.dtype == 'object':
+            return pd.to_numeric(series.str.replace(',', ''), errors='coerce').fillna(0)
+        return pd.to_numeric(series, errors='coerce').fillna(0)
+
+    clean_depth_vol = clean_vol(depth_df_session['Volume'])
+    # --- CLOUD-PROOFING END ---
+
     # Prepare Data for Heatmap
-    depth_df_session['SignedVolume'] = np.where(depth_df_session['Type'] == 'BUY', depth_df_session['Volume'], -depth_df_session['Volume'])
+    depth_df_session['SignedVolume'] = np.where(
+        depth_df_session['Type'] == 'BUY', 
+        clean_depth_vol, 
+        -clean_depth_vol
+    )
     heatmap_pivot = depth_df_session.pivot_table(index='Price', columns='datetime', values='SignedVolume', aggfunc='sum').fillna(0)
     
     min_price, max_price = sales_df_session['Price'].min(), sales_df_session['Price'].max()
