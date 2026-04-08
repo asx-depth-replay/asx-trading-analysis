@@ -603,8 +603,8 @@ st.sidebar.header("⚙️ Controls")
 # --- Persistent File Uploaders ---
 with st.sidebar.expander("📂 Data Files Upload", expanded=True):
     st.markdown("Upload your CSV files here. You can collapse this menu once loaded.")
-    sales_file = st.file_uploader("1. Upload Course of Sales", type=["csv"])
-    depth_file = st.file_uploader("2. Upload Market Depth", type=["csv"])
+    sales_file = st.file_uploader("1. Upload Course of Sales", type=["csv", "parquet"])
+    depth_file = st.file_uploader("2. Upload Market Depth", type=["csv", "parquet"])
 st.sidebar.markdown("---")
 
 # --- Main App Logic ---
