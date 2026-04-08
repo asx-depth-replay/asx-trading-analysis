@@ -495,15 +495,20 @@ def create_hourly_pivot(df, price_grouping):
     if df is None or df.empty: return pd.DataFrame(), pd.DataFrame()
     df_copy = df.copy()
     df_copy['Hour'] = df_copy['datetime'].dt.hour
+    
     if price_grouping > 0:
-        df_copy['price_bin'] = (df_copy['Price'] / price_grouping).apply(np.floor) * price_grouping
+        # Calculate the bin and immediately round to 2 decimal places
+        df_copy['price_bin'] = ((df_copy['Price'] / price_grouping).apply(np.floor) * price_grouping).round(2)
     else:
-        df_copy['price_bin'] = df_copy['Price']
+        df_copy['price_bin'] = df_copy['Price'].round(2)
+        
     pivot = pd.pivot_table(df_copy, values='Volume', index='price_bin', columns='Hour', aggfunc='sum', fill_value=0, margins=True, margins_name='Grand Total')
+    
     grand_total_row = pivot.loc[['Grand Total']]
     data_rows = pivot.drop('Grand Total')
     sorted_data_rows = data_rows.sort_index(ascending=False)
     pivot = pd.concat([sorted_data_rows, grand_total_row])
+    
     return pivot, df_copy
 
 def create_hourly_distribution_fig(df):
