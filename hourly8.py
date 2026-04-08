@@ -674,6 +674,9 @@ if depth_file:
     with st.spinner('Reading Market Depth... this may take a minute for large files.'):
         df_depth = load_depth_data(depth_file)
     st.success('Market Depth Loaded!')
+    # Extract info for filenames
+    ticker = df_depth['Ticker'].iloc[0] if 'Ticker' in df_depth.columns else "Unknown"
+    date_str = df_depth['datetime'].iloc[0].strftime('%Y%m%d')
 
 if sales_file:
     trade_date = df_depth['datetime'].iloc[0].date() if df_depth is not None and not df_depth.empty else datetime.date.today()
@@ -734,7 +737,19 @@ if analysis_type == "Market Depth Explorer":
             with st.spinner("Rendering Heatmap..."):
                 heatmap_fig = create_heatmap_fig(df_depth, df_sales)
                 if heatmap_fig:
-                    st.plotly_chart(heatmap_fig, use_container_width=True)
+                    st.plotly_chart(
+                        heatmap_fig, 
+                        use_container_width=True,
+                        config={
+                            'toImageButtonOptions': {
+                                'format': 'png', # one of png, svg, jpeg, webp
+                                'filename': f'{date_str}_Heatmap_{ticker}',
+                                'height': 700,
+                                'width': 1200,
+                                'scale': 2 # Increases resolution for better quality
+                            }
+                        }
+                    )
 
         # ==========================================
         # 2. ORDER BOOK SNAPSHOT EXPLORER (Collapsible)
@@ -905,6 +920,18 @@ elif df_sales is not None:
             
             if volume_profile_fig: 
                 st.pyplot(volume_profile_fig)
+                
+                # Save the plot to a buffer to enable downloading
+                import io
+                buf = io.BytesIO()
+                volume_profile_fig.savefig(buf, format="png", bbox_inches='tight')
+                
+                st.download_button(
+                    label="💾 Download Volume Profile as PNG",
+                    data=buf.getvalue(),
+                    file_name=f"{date_str}_VP_{ticker}.png",
+                    mime="image/png"
+                )
                 plt.close(volume_profile_fig)
 
         elif analysis_type == "Hourly Volume Distribution":
