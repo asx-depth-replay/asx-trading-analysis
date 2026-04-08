@@ -107,12 +107,12 @@ def order_book_explorer_fragment(df_depth, df_sales):
     # 1. Filter and sort Bids
     bids = snapshot_df[snapshot_df['Type'] == 'BUY'].sort_values('Price', ascending=False)
     # Select only the columns you want, in the order of the first screenshot
-    bids_display = bids[['Number_of_Orders', 'Volume', 'Price']]
+    bids_display = bids[['Number_of_Orders', 'Volume', 'Price']].reset_index(drop=True)
 
     # 2. Filter and sort Asks
     asks = snapshot_df[snapshot_df['Type'] == 'SELL'].sort_values('Price', ascending=True)
     # Select only the columns you want
-    asks_display = asks[['Price', 'Volume', 'Number_of_Orders']]
+    asks_display = asks[['Price', 'Volume', 'Number_of_Orders']].reset_index(drop=True)
 
     # 3. Handle the "Depth" radio button logic
     if depth_opt != 'Full Book':
@@ -125,10 +125,10 @@ def order_book_explorer_fragment(df_depth, df_sales):
     with c1:
         st.subheader("Buyers (Bids)")
         # use hide_index=True to remove the row numbers on the far left
-        st.dataframe(bids_display, use_container_width=True, hide_index=True)
+        st.dataframe(bids_display, use_container_width=True, hide_index=False)
     with c2:
         st.subheader("Sellers (Asks)")
-        st.dataframe(asks_display, use_container_width=True, hide_index=True)
+        st.dataframe(asks_display, use_container_width=True, hide_index=False)
         
 @st.cache_data
 def generate_footprint_data(sales_df, depth_df, timeframe_str):
