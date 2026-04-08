@@ -81,6 +81,41 @@ def load_depth_data(uploaded_file):
         st.error(f"Error loading Market Depth data: {e}")
         return None
 
+@st.fragment
+def order_book_explorer_fragment(df_depth, df_sales):
+    st.markdown("Drill down into the exact order book state at any given second.")
+    available_times = sorted(df_depth['datetime'].unique())
+
+    if not available_times:
+        st.error("No valid time entries found.")
+        return
+
+    col1, col2 = st.columns([3, 2])
+    with col1:
+        # Moving this slider now ONLY reruns this function!
+        snapshot_time = st.select_slider(
+            "Select Snapshot Time:", 
+            options=available_times, 
+            format_func=lambda x: pd.to_datetime(x).strftime('%I:%M:%S %p')
+        )
+    with col2:
+        depth_opt = st.radio("Depth:", ['Top 10', 'Top 20', 'Full Book'], index=2, horizontal=True)
+
+    # Fast filtering logic
+    snapshot_df = df_depth[df_depth['datetime'] == snapshot_time]
+    
+    # ... (Keep your existing table display logic here)
+    bids = snapshot_df[snapshot_df['Type'] == 'BUY'].sort_values('Price', ascending=False)
+    asks = snapshot_df[snapshot_df['Type'] == 'SELL'].sort_values('Price', ascending=True)
+
+    c1, c2 = st.columns(2)
+    with c1:
+        st.subheader("Bids")
+        st.dataframe(bids, use_container_width=True)
+    with c2:
+        st.subheader("Asks")
+        st.dataframe(asks, use_container_width=True)
+
 @st.cache_data
 def generate_footprint_data(sales_df, depth_df, timeframe_str):
     # 1. Extract Bids and Asks
@@ -691,8 +726,8 @@ if analysis_type == "Market Depth Explorer":
         # 2. ORDER BOOK SNAPSHOT EXPLORER (Collapsible)
         # ==========================================
         with st.expander("📸 Order Book Snapshot Explorer", expanded=False):
-            st.markdown("Drill down into the exact order book state at any given second.")
-            available_times = sorted(df_depth['datetime'].unique())
+            # Call the fragment function we defined above
+            order_book_explorer_fragment(df_depth, df_sales)
 
             if not available_times:
                 st.error("Could not find any valid time entries in the Market Depth file.")
