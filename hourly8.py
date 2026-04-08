@@ -729,44 +729,6 @@ if analysis_type == "Market Depth Explorer":
             # Call the fragment function we defined above
             order_book_explorer_fragment(df_depth, df_sales)
 
-            if not available_times:
-                st.error("Could not find any valid time entries in the Market Depth file.")
-            else:
-                col1, col2 = st.columns([3, 2])
-                with col1:
-                    snapshot_time = st.select_slider("Select a specific time to view the order book:", options=available_times, format_func=lambda x: pd.to_datetime(x).strftime('%I:%M:%S %p'))
-                with col2:
-                    depth_display_option = st.radio("Order Book Depth:", options=['Top 10', 'Top 20', 'Top 30', 'Full Book'], index=3, horizontal=True)
-
-                st.markdown(f"**Showing order book for snapshot at {pd.to_datetime(snapshot_time).strftime('%I:%M:%S %p')}.**")
-                
-                snapshot_df = df_depth[df_depth['datetime'] == snapshot_time]
-                bids_table = snapshot_df[snapshot_df['Type'] == 'BUY'][['Number_of_Orders', 'Volume', 'Price']].sort_values('Price', ascending=False).reset_index(drop=True)
-                asks_table = snapshot_df[snapshot_df['Type'] == 'SELL'][['Price', 'Volume', 'Number_of_Orders']].sort_values('Price', ascending=True).reset_index(drop=True)
-
-                if depth_display_option != 'Full Book':
-                    depth = int(depth_display_option.split(' ')[1])
-                    bids_table = bids_table.head(depth)
-                    asks_table = asks_table.head(depth)
-
-                col_buy, col_sell = st.columns(2)
-                with col_buy:
-                    st.subheader("Buyers (Bids)")
-                    st.dataframe(bids_table, use_container_width=True)
-                with col_sell:
-                    st.subheader("Sellers (Asks)")
-                    st.dataframe(asks_table, use_container_width=True)
-                    
-                st.markdown("---")
-                compare_trades = st.toggle("Compare with Executed Trades", value=True)
-
-                if compare_trades:
-                    minutes_after = st.number_input("Show trades for how many minutes after the snapshot?", min_value=1, max_value=60, value=5)
-                    end_time_dt = pd.to_datetime(snapshot_time) + datetime.timedelta(minutes=minutes_after)
-                    comparison_df = df_sales[(df_sales['datetime'] > pd.to_datetime(snapshot_time)) & (df_sales['datetime'] <= end_time_dt)]
-                    st.markdown(f"**Showing {len(comparison_df)} executed trades between {pd.to_datetime(snapshot_time).strftime('%I:%M:%S %p')} and {end_time_dt.strftime('%I:%M:%S %p')}:**")
-                    st.dataframe(comparison_df[['datetime', 'Price', 'Volume']].rename(columns={'datetime': 'Time'}))
-
         # ==========================================
         # 3. FOOTPRINT CHART (Collapsible)
         # ==========================================
