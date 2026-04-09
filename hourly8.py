@@ -117,8 +117,11 @@ def order_book_explorer_fragment(df_depth, df_sales):
             format_func=lambda x: pd.to_datetime(x).strftime('%I:%M:%S %p'),
             key="actual_slider_widget" 
         )
-        # Keep the index in sync if the user drags the slider
-        st.session_state.snap_idx = available_times.index(snapshot_time)
+        # 5. SYNC: Update the index if the user manually drags the slider
+        # This prevents the "jumping back" bug
+        new_idx = available_times.index(snapshot_time)
+        if new_idx != st.session_state.snap_idx:
+            st.session_state.snap_idx = new_idx
 
     # 3. ROW 2: Depth Options
     # We place this here so it doesn't squeeze the slider
