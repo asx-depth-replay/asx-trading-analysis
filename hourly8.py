@@ -90,41 +90,42 @@ def order_book_explorer_fragment(df_depth, df_sales):
         st.error("No valid time entries found.")
         return
 
-    # 1. Initialize the index if it doesn't exist
-    if 'snap_idx' not in st.session_state:
-        st.session_state.snap_idx = 0
+    # 1. Initialize the slider's state if it doesn't exist
+    # We use the actual time value as the state, not the index number
+    if "snapshot_slider" not in st.session_state:
+        st.session_state["snapshot_slider"] = available_times[0]
 
-    # 2. ROW 1: Navigation (Arrows + Slider)
+    # 2. Define Callbacks to shift the time
+    def move_snap(direction):
+        current_val = st.session_state["snapshot_slider"]
+        current_idx = available_times.index(current_val)
+        
+        if direction == "next" and current_idx < len(available_times) - 1:
+            st.session_state["snapshot_slider"] = available_times[current_idx + 1]
+        elif direction == "prev" and current_idx > 0:
+            st.session_state["snapshot_slider"] = available_times[current_idx - 1]
+
+    # 3. Layout: Navigation
     col_prev, col_slide, col_next = st.columns([1, 8, 1])
     
     with col_prev:
-        st.markdown("<br>", unsafe_allow_html=True) 
-        if st.button("⬅️", help="Previous Second", use_container_width=True):
-            if st.session_state.snap_idx > 0:
-                st.session_state.snap_idx -= 1
+        st.markdown("<br>", unsafe_allow_html=True)
+        st.button("⬅️", on_click=move_snap, args=("prev",), use_container_width=True)
 
     with col_next:
         st.markdown("<br>", unsafe_allow_html=True)
-        if st.button("➡️", help="Next Second", use_container_width=True):
-            if st.session_state.snap_idx < len(available_times) - 1:
-                st.session_state.snap_idx += 1
+        st.button("➡️", on_click=move_snap, args=("next",), use_container_width=True)
 
     with col_slide:
+        # 4. The Slider - 'value' is omitted because 'key' handles it automatically
         snapshot_time = st.select_slider(
             "Select Snapshot Time:", 
             options=available_times, 
-            value=available_times[st.session_state.snap_idx],
             format_func=lambda x: pd.to_datetime(x).strftime('%I:%M:%S %p'),
-            key="actual_slider_widget" 
+            key="snapshot_slider" 
         )
-        # 5. SYNC: Update the index if the user manually drags the slider
-        # This prevents the "jumping back" bug
-        new_idx = available_times.index(snapshot_time)
-        if new_idx != st.session_state.snap_idx:
-            st.session_state.snap_idx = new_idx
 
-    # 3. ROW 2: Depth Options
-    # We place this here so it doesn't squeeze the slider
+    # 5. Depth Selection
     depth_opt = st.radio("Order Book Depth Display:", ['Top 10', 'Top 20', 'Full Book'], index=2, horizontal=True)
 
     # Fast filtering logic
