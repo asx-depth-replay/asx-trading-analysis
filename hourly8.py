@@ -90,16 +90,39 @@ def order_book_explorer_fragment(df_depth, df_sales):
         st.error("No valid time entries found.")
         return
 
-    col1, col2 = st.columns([3, 2])
-    with col1:
-        # Moving this slider now ONLY reruns this function!
+    # 1. Initialize the index if it doesn't exist
+    if 'snap_idx' not in st.session_state:
+        st.session_state.snap_idx = 0
+
+    # 2. ROW 1: Navigation (Arrows + Slider)
+    col_prev, col_slide, col_next = st.columns([1, 8, 1])
+    
+    with col_prev:
+        st.markdown("<br>", unsafe_allow_html=True) 
+        if st.button("⬅️", help="Previous Second", use_container_width=True):
+            if st.session_state.snap_idx > 0:
+                st.session_state.snap_idx -= 1
+
+    with col_next:
+        st.markdown("<br>", unsafe_allow_html=True)
+        if st.button("➡️", help="Next Second", use_container_width=True):
+            if st.session_state.snap_idx < len(available_times) - 1:
+                st.session_state.snap_idx += 1
+
+    with col_slide:
         snapshot_time = st.select_slider(
             "Select Snapshot Time:", 
             options=available_times, 
-            format_func=lambda x: pd.to_datetime(x).strftime('%I:%M:%S %p')
+            value=available_times[st.session_state.snap_idx],
+            format_func=lambda x: pd.to_datetime(x).strftime('%I:%M:%S %p'),
+            key="actual_slider_widget" 
         )
-    with col2:
-        depth_opt = st.radio("Depth:", ['Top 10', 'Top 20', 'Full Book'], index=2, horizontal=True)
+        # Keep the index in sync if the user drags the slider
+        st.session_state.snap_idx = available_times.index(snapshot_time)
+
+    # 3. ROW 2: Depth Options
+    # We place this here so it doesn't squeeze the slider
+    depth_opt = st.radio("Order Book Depth Display:", ['Top 10', 'Top 20', 'Full Book'], index=2, horizontal=True)
 
     # Fast filtering logic
     snapshot_df = df_depth[df_depth['datetime'] == snapshot_time]
