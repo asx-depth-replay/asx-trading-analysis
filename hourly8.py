@@ -6,6 +6,42 @@ from matplotlib.ticker import FuncFormatter
 import datetime
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseDownload
+import io
+
+# --- GOOGLE DRIVE HELPERS ---
+def get_gdrive_service():
+    """Authenticates using Streamlit Secrets."""
+    creds = service_account.Credentials.from_service_account_info(st.secrets["gdrive_service_account"])
+    return build('drive', 'v3', credentials=creds)
+
+def list_drive_folders(parent_id):
+    """Lists subfolders (Tickers) in the root folder."""
+    service = get_gdrive_service()
+    query = f"'{parent_id}' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
+    results = service.files().list(q=query, fields="files(id, name)").execute()
+    return {f['name']: f['id'] for f in results.get('files', [])}
+
+def list_files_in_folder(folder_id):
+    """Lists all parquet/csv files in a specific ticker's folder."""
+    service = get_gdrive_service()
+    query = f"'{folder_id}' in parents and (name contains '.parquet' or name contains '.csv') and trashed = false"
+    results = service.files().list(q=query, fields="files(id, name)").execute()
+    return {f['name']: f['id'] for f in results.get('files', [])}
+
+def download_from_gdrive(file_id):
+    """Downloads file from Drive into memory."""
+    service = get_gdrive_service()
+    request = service.files().get_media(fileId=file_id)
+    fh = io.BytesIO()
+    downloader = MediaIoBaseDownload(fh, request)
+    done = False
+    while not done:
+        status, done = downloader.next_chunk()
+    fh.seek(0)
+    return fh
 
 # --- App Configuration ---
 st.set_page_config(layout="wide", page_title="Trading Session Review")
@@ -686,12 +722,55 @@ st.title("📈 Interactive Trade Session Analysis Tool")
 # --- Sidebar for Controls ---
 st.sidebar.header("⚙️ Controls")
 
-# --- Persistent File Uploaders ---
-with st.sidebar.expander("📂 Data Files Upload", expanded=True):
-    st.markdown("Upload your CSV files here. You can collapse this menu once loaded.")
-    sales_file = st.file_uploader("1. Upload Course of Sales", type=["csv", "parquet"])
-    depth_file = st.file_uploader("2. Upload Market Depth", type=["csv", "parquet"])
-st.sidebar.markdown("---")
+# --- GOOGLE DRIVE SELECTOR ---
+    st.sidebar.header("Session Database")
+    
+    # Replace with your actual Google Drive Root Folder ID
+    ROOT_FOLDER_ID = "11n_EsXh_a8HZo_f1tOHUepCSjAq4TvMn" 
+    
+    try:
+        # 1. Select Ticker
+        tickers_dict = list_drive_folders(ROOT_FOLDER_ID)
+        selected_ticker = st.sidebar.selectbox("Select Ticker", options=sorted(tickers_dict.keys()))
+
+        if selected_ticker:
+            # 2. Select File from Ticker Folder
+            ticker_id = tickers_dict[selected_ticker]
+            files_dict = list_files_in_folder(ticker_id)
+            
+            # Filter for Depth vs Sales
+            depth_files = {k: v for k, v in files_dict.items() if "Depth" in k}
+            sales_files = {k: v for k, v in files_dict.items() if "Trades" in k or "Sales" in k}
+
+            # Dropdowns for specific files
+            depth_choice = st.sidebar.selectbox("Market Depth File", options=["None"] + sorted(depth_files.keys(), reverse=True))
+            sales_choice = st.sidebar.selectbox("Course of Sales File", options=["None"] + sorted(sales_files.keys(), reverse=True))
+
+            # Logic to trigger download
+            if st.sidebar.button("🚀 Load Drive Files"):
+                if depth_choice != "None":
+                    with st.spinner("Downloading Depth..."):
+                        depth_data = download_from_gdrive(depth_files[depth_choice])
+                        depth_data.name = depth_choice # Mimic file object name
+                        st.session_state['df_depth'] = load_depth_data(depth_data)
+                
+                if sales_choice != "None":
+                    with st.spinner("Downloading Sales..."):
+                        # Get date from depth if possible to align trades
+                        t_date = st.session_state['df_depth']['datetime'].iloc[0].date() if 'df_depth' in st.session_state else datetime.date.today()
+                        sales_data = download_from_gdrive(sales_files[sales_choice])
+                        sales_data.name = sales_choice
+                        st.session_state['df_sales'] = load_sales_data(sales_data, t_date)
+                        
+    except Exception as e:
+        st.sidebar.error(f"Drive Connection Error: {e}")
+
+    st.sidebar.divider()
+    
+    # Optional: Keep the manual uploader below just in case
+    with st.sidebar.expander("📁 Manual Local Upload"):
+        sales_file = st.file_uploader("Upload Sales", type=["csv", "parquet"])
+        depth_file = st.file_uploader("Upload Depth", type=["csv", "parquet"])
 
 # --- Main App Logic ---
 df_sales = None
