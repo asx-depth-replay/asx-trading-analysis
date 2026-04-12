@@ -812,32 +812,33 @@ global_bin_size = st.sidebar.selectbox(
     index=1 # Defaults to $0.05
 )
 
-    # --- Global Trade Filtering (Collapsible) ---
-    if df_sales is not None and not df_sales.empty:
-        with st.sidebar.expander("⚖️ Trade Filtering (Global)", expanded=True):
-            
-            # 1. Market Filter
-            markets = df_sales['Market'].unique().tolist()
-            selected_markets = st.multiselect("Include Markets:", options=markets, default=markets)
-            
-            # 2. Condition Filter
-            conditions = df_sales['Condition'].unique().tolist()
-            default_conds = ['Lit Order Book'] if 'Lit Order Book' in conditions else conditions
-            selected_conditions = st.multiselect(
-                "Include Trade Conditions:", 
-                options=conditions, 
-                default=default_conds,
-                help="Uncheck special conditions to remove off-market block trades."
-            )
-            
-        # Apply the filters to df_sales so it cascades to EVERY chart in the app
-        df_sales = df_sales[
-            (df_sales['Market'].isin(selected_markets)) & 
-            (df_sales['Condition'].isin(selected_conditions))
-        ]
+# --- Global Trade Filtering (Collapsible) ---
+# This block must start at the far left (no leading spaces)
+if df_sales is not None and not df_sales.empty:
+    with st.sidebar.expander("⚖️ Trade Filtering (Global)", expanded=True):
         
-        if df_sales.empty:
-            st.sidebar.error("All trades filtered out! Please select at least one Market and Condition.")
+        # 1. Market Filter
+        markets = df_sales['Market'].unique().tolist()
+        selected_markets = st.multiselect("Include Markets:", options=markets, default=markets)
+        
+        # 2. Condition Filter
+        conditions = df_sales['Condition'].unique().tolist()
+        default_conds = ['Lit Order Book'] if 'Lit Order Book' in conditions else conditions
+        selected_conditions = st.multiselect(
+            "Include Trade Conditions:", 
+            options=conditions, 
+            default=default_conds,
+            help="Uncheck special conditions to remove off-market block trades."
+        )
+        
+    # Apply the filters to df_sales so it cascades to EVERY chart in the app
+    df_sales = df_sales[
+        (df_sales['Market'].isin(selected_markets)) & 
+        (df_sales['Condition'].isin(selected_conditions))
+    ]
+    
+    if df_sales.empty:
+        st.sidebar.error("All trades filtered out! Please select at least one Market and Condition.")
 
 
 if analysis_type == "Market Depth Explorer":
