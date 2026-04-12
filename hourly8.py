@@ -723,71 +723,95 @@ st.title("📈 Interactive Trade Session Analysis Tool")
 st.sidebar.header("⚙️ Controls")
 
 # --- GOOGLE DRIVE SELECTOR ---
-    st.sidebar.header("Session Database")
+st.sidebar.header("Session Database")
     
-    # Replace with your actual Google Drive Root Folder ID
-    ROOT_FOLDER_ID = "11n_EsXh_a8HZo_f1tOHUepCSjAq4TvMn" 
+# Replace with your actual Google Drive Root Folder ID
+ROOT_FOLDER_ID = "11n_EsXh_a8HZo_f1tOHUepCSjAq4TvMn" 
     
-    try:
-        # 1. Select Ticker
-        tickers_dict = list_drive_folders(ROOT_FOLDER_ID)
-        selected_ticker = st.sidebar.selectbox("Select Ticker", options=sorted(tickers_dict.keys()))
+try:
+    # 1. Select Ticker
+    tickers_dict = list_drive_folders(ROOT_FOLDER_ID)
+    selected_ticker = st.sidebar.selectbox("Select Ticker", options=sorted(tickers_dict.keys()))
 
-        if selected_ticker:
-            # 2. Select File from Ticker Folder
-            ticker_id = tickers_dict[selected_ticker]
-            files_dict = list_files_in_folder(ticker_id)
+    if selected_ticker:
+        # 2. Select File from Ticker Folder
+        ticker_id = tickers_dict[selected_ticker]
+        files_dict = list_files_in_folder(ticker_id)
+        
+        # Filter for Depth vs Sales
+        depth_files = {k: v for k, v in files_dict.items() if "Depth" in k}
+        sales_files = {k: v for k, v in files_dict.items() if "Trades" in k or "Sales" in k}
+
+        # Dropdowns for specific files
+        depth_choice = st.sidebar.selectbox("Market Depth File", options=["None"] + sorted(depth_files.keys(), reverse=True))
+        sales_choice = st.sidebar.selectbox("Course of Sales File", options=["None"] + sorted(sales_files.keys(), reverse=True))
+
+        # Logic to trigger download
+        if st.sidebar.button("🚀 Load Drive Files"):
+            if depth_choice != "None":
+                with st.spinner("Downloading Depth..."):
+                    depth_data = download_from_gdrive(depth_files[depth_choice])
+                    depth_data.name = depth_choice 
+                    st.session_state['df_depth'] = load_depth_data(depth_data)
             
-            # Filter for Depth vs Sales
-            depth_files = {k: v for k, v in files_dict.items() if "Depth" in k}
-            sales_files = {k: v for k, v in files_dict.items() if "Trades" in k or "Sales" in k}
-
-            # Dropdowns for specific files
-            depth_choice = st.sidebar.selectbox("Market Depth File", options=["None"] + sorted(depth_files.keys(), reverse=True))
-            sales_choice = st.sidebar.selectbox("Course of Sales File", options=["None"] + sorted(sales_files.keys(), reverse=True))
-
-            # Logic to trigger download
-            if st.sidebar.button("🚀 Load Drive Files"):
-                if depth_choice != "None":
-                    with st.spinner("Downloading Depth..."):
-                        depth_data = download_from_gdrive(depth_files[depth_choice])
-                        depth_data.name = depth_choice # Mimic file object name
-                        st.session_state['df_depth'] = load_depth_data(depth_data)
-                
-                if sales_choice != "None":
-                    with st.spinner("Downloading Sales..."):
-                        # Get date from depth if possible to align trades
-                        t_date = st.session_state['df_depth']['datetime'].iloc[0].date() if 'df_depth' in st.session_state else datetime.date.today()
-                        sales_data = download_from_gdrive(sales_files[sales_choice])
-                        sales_data.name = sales_choice
-                        st.session_state['df_sales'] = load_sales_data(sales_data, t_date)
+            if sales_choice != "None":
+                with st.spinner("Downloading Sales..."):
+                    # Use a fallback date if df_depth isn't loaded yet
+                    t_date = datetime.date.today()
+                    if 'df_depth' in st.session_state and st.session_state['df_depth'] is not None:
+                        t_date = st.session_state['df_depth']['datetime'].iloc[0].date()
+                    
+                    sales_data = download_from_gdrive(sales_files[sales_choice])
+                    sales_data.name = sales_choice
+                    st.session_state['df_sales'] = load_sales_data(sales_data, t_date)
                         
-    except Exception as e:
-        st.sidebar.error(f"Drive Connection Error: {e}")
+except Exception as e:
+    st.sidebar.error(f"Drive Connection Error: {e}")
 
-    st.sidebar.divider()
-    
-    # Optional: Keep the manual uploader below just in case
-    with st.sidebar.expander("📁 Manual Local Upload"):
-        sales_file = st.file_uploader("Upload Sales", type=["csv", "parquet"])
-        depth_file = st.file_uploader("Upload Depth", type=["csv", "parquet"])
+st.sidebar.divider()
+
+# Optional: Manual uploader
+with st.sidebar.expander("📁 Manual Local Upload"):
+    sales_file = st.file_uploader("Upload Sales", type=["csv", "parquet"])
+    depth_file = st.file_uploader("Upload Depth", type=["csv", "parquet"])
 
 # --- Main App Logic ---
-df_sales = None
-df_depth = None
+# Pull from session state (Drive) or local upload
+df_depth = st.session_state.get('df_depth')
+df_sales = st.session_state.get('df_sales')
 
+# If local upload is used, override the session state
 if depth_file:
-    with st.spinner('Reading Market Depth... this may take a minute for large files.'):
+    with st.spinner('Reading Local Market Depth...'):
         df_depth = load_depth_data(depth_file)
-    st.success('Market Depth Loaded!')
-    # Extract info for filenames
-    ticker = df_depth['Ticker'].iloc[0] if 'Ticker' in df_depth.columns else "Unknown"
-    date_str = df_depth['datetime'].iloc[0].strftime('%Y%m%d')
+        st.session_state['df_depth'] = df_depth
 
-if sales_file:
-    trade_date = df_depth['datetime'].iloc[0].date() if df_depth is not None and not df_depth.empty else datetime.date.today()
+if sales_file is not None:
+    trade_date = df_depth['datetime'].iloc[0].date() if df_depth is not None else datetime.date.today()
     df_sales = load_sales_data(sales_file, trade_date)
-    
+    st.session_state['df_sales'] = df_sales
+
+# Setup metadata for filenames (Download buttons)
+ticker = "Unknown"
+if df_depth is not None and not df_depth.empty:
+    if 'Ticker' in df_depth.columns:
+        ticker = df_depth['Ticker'].iloc[0]
+date_str = df_depth['datetime'].iloc[0].strftime('%Y%m%d') if df_depth is not None else "UnknownDate"
+
+st.sidebar.subheader("Analysis Options")
+analysis_type = st.sidebar.selectbox(
+    "Select Analysis Type",
+    ["Hourly Volume Analysis", "Volume Profile", "Hourly Volume Distribution", "Market Depth Explorer"]
+)
+
+# Global Price Bin Size (Consolidated)
+global_bin_size = st.sidebar.selectbox(
+    "Global Price Bin Size:", 
+    options=[0.00, 0.05, 0.10, 0.20, 0.30, 0.40, 0.50, 1.00], 
+    format_func=lambda x: f"${x:.2f}" if x > 0 else "No Grouping", 
+    index=1 # Defaults to $0.05
+)
+
     # --- Global Trade Filtering (Collapsible) ---
     if df_sales is not None and not df_sales.empty:
         with st.sidebar.expander("⚖️ Trade Filtering (Global)", expanded=True):
@@ -806,14 +830,6 @@ if sales_file:
                 help="Uncheck special conditions to remove off-market block trades."
             )
             
-            # 3. Global Price Bin Size (Consolidated)
-            global_bin_size = st.selectbox(
-                "Global Price Bin Size:", 
-                options=[0.00, 0.05, 0.10, 0.20, 0.30, 0.40, 0.50, 1.00], 
-                format_func=lambda x: f"${x:.2f}" if x > 0 else "No Grouping", 
-                index=1 # Defaults to $0.05
-            )
-            
         # Apply the filters to df_sales so it cascades to EVERY chart in the app
         df_sales = df_sales[
             (df_sales['Market'].isin(selected_markets)) & 
@@ -823,11 +839,6 @@ if sales_file:
         if df_sales.empty:
             st.sidebar.error("All trades filtered out! Please select at least one Market and Condition.")
 
-st.sidebar.subheader("Analysis Options")
-analysis_type = st.sidebar.selectbox(
-    "Select Analysis Type",
-    ["Hourly Volume Analysis", "Volume Profile", "Hourly Volume Distribution", "Market Depth Explorer"]
-)
 
 if analysis_type == "Market Depth Explorer":
     st.header("🔍 Market Depth & Order Flow Explorer")
