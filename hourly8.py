@@ -491,7 +491,8 @@ def create_continuous_footprint_chart(ohlc_df, footprint_df, stats_df, tf_mins, 
         title=f"Profile Footprint Chart ({tf_mins}-Minute Candles)",
         xaxis_rangeslider_visible=False,
         height=850, margin=dict(l=40, r=40, t=60, b=40),
-        hovermode="x unified", plot_bgcolor='white', paper_bgcolor='white'
+        hovermode="x unified", plot_bgcolor='white', paper_bgcolor='white',
+        legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1)
     )
     
     fig.update_yaxes(title_text="Price", tickformat=".2f", row=1, col=1, autorange=True)
@@ -727,55 +728,54 @@ st.title("📈 Interactive Trade Session Analysis Tool")
 st.sidebar.header("⚙️ Controls")
 
 # --- GOOGLE DRIVE SELECTOR ---
-st.sidebar.header("Session Database")
-    
-# Replace with your actual Google Drive Root Folder ID
-ROOT_FOLDER_ID = "11n_EsXh_a8HZo_f1tOHUepCSjAq4TvMn" 
-    
-try:
-    # 1. Select Ticker
-    tickers_dict = list_drive_folders(ROOT_FOLDER_ID)
-    selected_ticker = st.sidebar.selectbox("Select Ticker", options=sorted(tickers_dict.keys()))
+with st.sidebar.expander("Session Database", expanded=True):
+    # Replace with your actual Google Drive Root Folder ID
+    ROOT_FOLDER_ID = "11n_EsXh_a8HZo_f1tOHUepCSjAq4TvMn"
 
-    if selected_ticker:
-        # 2. Select File from Ticker Folder
-        ticker_id = tickers_dict[selected_ticker]
-        files_dict = list_files_in_folder(ticker_id)
-        
-        # Filter for Depth vs Sales
-        depth_files = {k: v for k, v in files_dict.items() if "Depth" in k}
-        sales_files = {k: v for k, v in files_dict.items() if any(x in k for x in ["Sales", "sales"])}
+    try:
+        # 1. Select Ticker
+        tickers_dict = list_drive_folders(ROOT_FOLDER_ID)
+        selected_ticker = st.selectbox("Select Ticker", options=sorted(tickers_dict.keys()))
 
-        # Dropdowns for specific files
-        depth_choice = st.sidebar.selectbox("Market Depth File", options=["None"] + sorted(depth_files.keys(), reverse=True))
-        sales_choice = st.sidebar.selectbox("Course of Sales File", options=["None"] + sorted(sales_files.keys(), reverse=True))
+        if selected_ticker:
+            # 2. Select File from Ticker Folder
+            ticker_id = tickers_dict[selected_ticker]
+            files_dict = list_files_in_folder(ticker_id)
 
-        # Logic to trigger download
-        if st.sidebar.button("🚀 Load Drive Files"):
-            if depth_choice != "None":
-                with st.spinner("Downloading Depth..."):
-                    # 1. This actually fetches the bits from Google
-                    depth_data = download_from_gdrive(depth_files[depth_choice])
-                    # 2. Pass the filename separately so the loader can detect parquet/csv
-                    #    without setting .name on the BytesIO (which makes PyArrow treat it
-                    #    as a filesystem path and fail with FileNotFoundError)
-                    st.session_state['df_depth'] = load_depth_data(depth_data, depth_choice)
+            # Filter for Depth vs Sales
+            depth_files = {k: v for k, v in files_dict.items() if "Depth" in k}
+            sales_files = {k: v for k, v in files_dict.items() if any(x in k for x in ["Sales", "sales"])}
 
-            if sales_choice != "None":
-                with st.spinner("Downloading Sales..."):
-                    t_date = datetime.date.today()
-                    if 'df_depth' in st.session_state and st.session_state['df_depth'] is not None:
-                        t_date = st.session_state['df_depth']['datetime'].iloc[0].date()
+            # Dropdowns for specific files
+            depth_choice = st.selectbox("Market Depth File", options=["None"] + sorted(depth_files.keys(), reverse=True))
+            sales_choice = st.selectbox("Course of Sales File", options=["None"] + sorted(sales_files.keys(), reverse=True))
 
-                    # 1. Fetch sales bits from Google
-                    sales_data = download_from_gdrive(sales_files[sales_choice])
-                    # 2. Load it into memory, passing filename for type detection
-                    st.session_state['df_sales'] = load_sales_data(sales_data, t_date, sales_choice)
-            
-            st.rerun() # Refresh to show the charts immediately
-                        
-except Exception as e:
-    st.sidebar.error(f"Drive Connection Error: {e}")
+            # Logic to trigger download
+            if st.button("🚀 Load Drive Files"):
+                if depth_choice != "None":
+                    with st.spinner("Downloading Depth..."):
+                        # 1. This actually fetches the bits from Google
+                        depth_data = download_from_gdrive(depth_files[depth_choice])
+                        # 2. Pass the filename separately so the loader can detect parquet/csv
+                        #    without setting .name on the BytesIO (which makes PyArrow treat it
+                        #    as a filesystem path and fail with FileNotFoundError)
+                        st.session_state['df_depth'] = load_depth_data(depth_data, depth_choice)
+
+                if sales_choice != "None":
+                    with st.spinner("Downloading Sales..."):
+                        t_date = datetime.date.today()
+                        if 'df_depth' in st.session_state and st.session_state['df_depth'] is not None:
+                            t_date = st.session_state['df_depth']['datetime'].iloc[0].date()
+
+                        # 1. Fetch sales bits from Google
+                        sales_data = download_from_gdrive(sales_files[sales_choice])
+                        # 2. Load it into memory, passing filename for type detection
+                        st.session_state['df_sales'] = load_sales_data(sales_data, t_date, sales_choice)
+
+                st.rerun() # Refresh to show the charts immediately
+
+    except Exception as e:
+        st.error(f"Drive Connection Error: {e}")
 
 st.sidebar.divider()
 
