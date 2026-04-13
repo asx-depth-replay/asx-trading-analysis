@@ -48,13 +48,15 @@ st.set_page_config(layout="wide", page_title="Trading Session Review")
 
 # --- Data Loading and Caching ---
 @st.cache_data
-def load_sales_data(uploaded_file, trade_date):
+def load_sales_data(uploaded_file, trade_date, filename=None):
     """
     Loads and processes the Course of Sales data, aligning it with the trade date from the depth file.
     """
     try:
+        # Resolve filename: prefer explicit param, fall back to attribute on the file object
+        _name = filename or getattr(uploaded_file, 'name', '')
         # Check if it's Parquet first (Parquet never has encoding errors!)
-        if uploaded_file.name.endswith('.parquet'):
+        if _name.endswith('.parquet'):
             df = pd.read_parquet(uploaded_file)
         else:
             # TRY CP1252 FIRST (Standard for ASX/Windows CSVs)
@@ -92,13 +94,15 @@ def load_sales_data(uploaded_file, trade_date):
         return None
 
 @st.cache_data
-def load_depth_data(uploaded_file):
+def load_depth_data(uploaded_file, filename=None):
     """
     Loads and processes the Market Depth data with robust cleaning.
     """
     try:
+        # Resolve filename: prefer explicit param, fall back to attribute on the file object
+        _name = filename or getattr(uploaded_file, 'name', '')
         # Check if it's a parquet file first
-        if uploaded_file.name.endswith('.parquet'):
+        if _name.endswith('.parquet'):
             df = pd.read_parquet(uploaded_file)
         else:
             # Existing CSV logic
@@ -752,22 +756,21 @@ try:
                 with st.spinner("Downloading Depth..."):
                     # 1. This actually fetches the bits from Google
                     depth_data = download_from_gdrive(depth_files[depth_choice])
-                    # 2. We give it a 'name' so the loader knows it's a parquet file
-                    depth_data.name = depth_choice 
-                    # 3. We pass that data into your loading function
-                    st.session_state['df_depth'] = load_depth_data(depth_data)
-            
+                    # 2. Pass the filename separately so the loader can detect parquet/csv
+                    #    without setting .name on the BytesIO (which makes PyArrow treat it
+                    #    as a filesystem path and fail with FileNotFoundError)
+                    st.session_state['df_depth'] = load_depth_data(depth_data, depth_choice)
+
             if sales_choice != "None":
                 with st.spinner("Downloading Sales..."):
                     t_date = datetime.date.today()
                     if 'df_depth' in st.session_state and st.session_state['df_depth'] is not None:
                         t_date = st.session_state['df_depth']['datetime'].iloc[0].date()
-                    
+
                     # 1. Fetch sales bits from Google
                     sales_data = download_from_gdrive(sales_files[sales_choice])
-                    sales_data.name = sales_choice
-                    # 2. Load it into memory
-                    st.session_state['df_sales'] = load_sales_data(sales_data, t_date)
+                    # 2. Load it into memory, passing filename for type detection
+                    st.session_state['df_sales'] = load_sales_data(sales_data, t_date, sales_choice)
             
             st.rerun() # Refresh to show the charts immediately
                         
