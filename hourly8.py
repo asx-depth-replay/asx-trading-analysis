@@ -782,27 +782,32 @@ with st.sidebar.expander("📁 Manual Local Upload"):
     depth_file = st.file_uploader("Upload Depth", type=["csv", "parquet"])
 
 # --- Main App Logic ---
-# Pull from session state (Drive) or local upload
+# 1. Initialize data from session state (This is where Drive downloads live)
 df_depth = st.session_state.get('df_depth')
 df_sales = st.session_state.get('df_sales')
 
-# If local upload is used, override the session state
+# 2. Check for Manual Local Uploads (These override Drive data if used)
 if depth_file:
     with st.spinner('Reading Local Market Depth...'):
+        # We pass the actual file object, not just the name
         df_depth = load_depth_data(depth_file)
         st.session_state['df_depth'] = df_depth
 
-if sales_file is not None:
-    trade_date = df_depth['datetime'].iloc[0].date() if df_depth is not None else datetime.date.today()
-    df_sales = load_sales_data(sales_file, trade_date)
-    st.session_state['df_sales'] = df_sales
+if sales_file:
+    with st.spinner('Reading Local Course of Sales...'):
+        # Align trades with depth date if available
+        trade_date = df_depth['datetime'].iloc[0].date() if df_depth is not None else datetime.date.today()
+        df_sales = load_sales_data(sales_file, trade_date)
+        st.session_state['df_sales'] = df_sales
 
-# Setup metadata for filenames (Download buttons)
+# 3. Setup metadata for filenames (Download buttons) - Safe Check
 ticker = "Unknown"
+date_str = "UnknownDate"
+
 if df_depth is not None and not df_depth.empty:
     if 'Ticker' in df_depth.columns:
         ticker = df_depth['Ticker'].iloc[0]
-date_str = df_depth['datetime'].iloc[0].strftime('%Y%m%d') if df_depth is not None else "UnknownDate"
+    date_str = df_depth['datetime'].iloc[0].strftime('%Y%m%d')
 
 st.sidebar.subheader("Analysis Options")
 analysis_type = st.sidebar.selectbox(
