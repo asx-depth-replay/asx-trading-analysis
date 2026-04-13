@@ -740,7 +740,7 @@ try:
         
         # Filter for Depth vs Sales
         depth_files = {k: v for k, v in files_dict.items() if "Depth" in k}
-        sales_files = {k: v for k, v in files_dict.items() if "Sales" in k}
+        sales_files = {k: v for k, v in files_dict.items() if any(x in k for x in ["Sales", "sales"])}
 
         # Dropdowns for specific files
         depth_choice = st.sidebar.selectbox("Market Depth File", options=["None"] + sorted(depth_files.keys(), reverse=True))
