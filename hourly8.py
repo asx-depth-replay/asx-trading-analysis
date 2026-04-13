@@ -750,20 +750,26 @@ try:
         if st.sidebar.button("🚀 Load Drive Files"):
             if depth_choice != "None":
                 with st.spinner("Downloading Depth..."):
+                    # 1. This actually fetches the bits from Google
                     depth_data = download_from_gdrive(depth_files[depth_choice])
+                    # 2. We give it a 'name' so the loader knows it's a parquet file
                     depth_data.name = depth_choice 
+                    # 3. We pass that data into your loading function
                     st.session_state['df_depth'] = load_depth_data(depth_data)
             
             if sales_choice != "None":
                 with st.spinner("Downloading Sales..."):
-                    # Use a fallback date if df_depth isn't loaded yet
                     t_date = datetime.date.today()
                     if 'df_depth' in st.session_state and st.session_state['df_depth'] is not None:
                         t_date = st.session_state['df_depth']['datetime'].iloc[0].date()
                     
+                    # 1. Fetch sales bits from Google
                     sales_data = download_from_gdrive(sales_files[sales_choice])
                     sales_data.name = sales_choice
+                    # 2. Load it into memory
                     st.session_state['df_sales'] = load_sales_data(sales_data, t_date)
+            
+            st.rerun() # Refresh to show the charts immediately
                         
 except Exception as e:
     st.sidebar.error(f"Drive Connection Error: {e}")
