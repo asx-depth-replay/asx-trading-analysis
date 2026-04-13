@@ -966,7 +966,7 @@ if analysis_type == "Market Depth Explorer":
                     st.download_button(
                         label="⬇️ Download Course of Sales Tick Data (.xlsx)",
                         data=excel_data,
-                        file_name=f"Enriched_Sales_{trade_date}.xlsx",
+                        file_name=f"Enriched_Sales_{fp_trade_date}.xlsx",
                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                     )
                 else:
