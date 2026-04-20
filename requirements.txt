@@ -9,3 +9,5 @@ google-auth-httplib2
 google-api-python-client
 xlsxwriter
 pyarrow
+scipy
+scikit-learn
