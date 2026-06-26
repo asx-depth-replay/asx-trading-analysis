@@ -109,7 +109,7 @@ def load_depth_data(uploaded_file, filename=None):
             df = pd.read_csv(uploaded_file)
             df.columns = ['Date', 'Time', 'Ticker', 'Type', 'Price', 'Volume', 'Number_of_Orders']
         
-        df['datetime'] = pd.to_datetime(df['Date'] + ' ' + df['Time'], errors='coerce')
+        df['datetime'] = pd.to_datetime(df['Date'] + ' ' + df['Time'], format='%d %b %Y %I:%M:%S %p', errors='coerce')
         
         for col in ['Price', 'Volume', 'Number_of_Orders']:
             if df[col].dtype == 'object':
