@@ -982,7 +982,7 @@ def render_backtesting_tab():
                         date = m.group(1)
                         if date not in valid_dates and any(f.startswith(date) for f in sales_files.keys()):
                             valid_dates.append(date)
-                valid_dates = sorted(valid_dates)
+                valid_dates = sorted(valid_dates, reverse=True)
 
                 if not valid_dates:
                     st.warning(f"No paired Depth + Sales sessions found for {ticker_name}.")
@@ -992,7 +992,9 @@ def render_backtesting_tab():
                         options=valid_dates, default=valid_dates,
                         format_func=lambda d: f"{d[:4]}-{d[4:6]}-{d[6:]}"
                     )
-                    for date in selected_dates:
+                    # Process chronologically (oldest first) so equity compounds in session order,
+                    # independent of the newest-first display/selection order above.
+                    for date in sorted(selected_dates):
                         depth_name = next(f for f in depth_files if f.startswith(date))
                         sales_name = next(f for f in sales_files if f.startswith(date))
                         session_specs.append({
@@ -1014,12 +1016,13 @@ def render_backtesting_tab():
                     m = re.match(r'^(\d{8})', f.name)
                     sales_by_date[m.group(1) if m else f.name] = f
 
-                common_dates = sorted(set(depth_by_date) & set(sales_by_date))
+                common_dates = sorted(set(depth_by_date) & set(sales_by_date), reverse=True)
                 if not common_dates:
                     st.warning("Could not match uploaded Depth/Sales files by a common YYYYMMDD date prefix. Rename files accordingly.")
                 else:
                     selected_dates = st.multiselect("Sessions to backtest:", options=common_dates, default=common_dates)
-                    for date in selected_dates:
+                    # Process chronologically (oldest first) so equity compounds in session order.
+                    for date in sorted(selected_dates):
                         session_specs.append({
                             'label': date, 'source': 'upload',
                             'depth_file': depth_by_date[date], 'depth_name': depth_by_date[date].name,
