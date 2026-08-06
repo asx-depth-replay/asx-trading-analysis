@@ -4,6 +4,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.ticker import FuncFormatter
 import datetime
+import re
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from google.oauth2 import service_account
@@ -718,8 +719,374 @@ def create_heatmap_fig(depth_df, sales_df):
         hovertemplate=('<b>Time:</b> %{x|%H:%M:%S}<br><b>Price:</b> $%{y:.3f}<br><b>Volume:</b> %{customdata[0]:,}<extra></extra>')
     ))
     fig.update_layout(height=650, title_text='Market Heatmap with Price Overlay', yaxis_title='Price Level')
-    
+
     return fig
+
+# --- Backtesting Engine (CVD-Regime / OU-Theta Strategy) ---
+
+def prep_session_frame(df, start='10:00:00', end='16:00:00'):
+    """Restrict a loaded depth/sales frame to the standard trading session and sort it."""
+    if df is None or df.empty:
+        return df
+    return df.set_index('datetime').between_time(start, end).reset_index().sort_values('datetime')
+
+def compute_backtest_signals(cos_df, md_df, base_span, vel_lb, smooth_win, ou_win):
+    """Builds the per-tick signal frame: order-book level velocity, DEMA CVD, and OU theta/Z-score regime."""
+    lc = md_df.groupby(['datetime', 'Type'])['Price'].nunique().reset_index()
+    pivot = lc.pivot(index='datetime', columns='Type', values='Price').fillna(0)
+    for col in ['BUY', 'SELL']:
+        if col not in pivot.columns:
+            pivot[col] = 0
+
+    b_ema = pivot['BUY'].ewm(span=base_span, adjust=False).mean()
+    s_ema = pivot['SELL'].ewm(span=base_span, adjust=False).mean()
+    b_vel_raw = b_ema.diff(periods=vel_lb).fillna(0)
+    s_vel_raw = s_ema.diff(periods=vel_lb).fillna(0)
+
+    b_e1 = b_vel_raw.ewm(span=smooth_win, adjust=False).mean()
+    b_e2 = b_e1.ewm(span=smooth_win, adjust=False).mean()
+    pivot['BUY_Vel'] = (2 * b_e1) - b_e2
+    pivot['CVD_BUY'] = pivot['BUY_Vel'].cumsum()
+
+    s_e1 = s_vel_raw.ewm(span=smooth_win, adjust=False).mean()
+    s_e2 = s_e1.ewm(span=smooth_win, adjust=False).mean()
+    pivot['SELL_Vel'] = (2 * s_e1) - s_e2
+    pivot['CVD_SELL'] = pivot['SELL_Vel'].cumsum()
+
+    # OU theta + Z-score regime filter
+    pivot['Imbalance'] = pivot['BUY'] - pivot['SELL']
+    x_prev = pivot['Imbalance'].shift(1)
+    dx = pivot['Imbalance'].diff()
+    roll_cov = x_prev.rolling(window=ou_win).cov(dx)
+    roll_var = x_prev.rolling(window=ou_win).var()
+    theta = (-roll_cov / roll_var).fillna(0).clip(lower=0)
+
+    z_win = ou_win * 2
+    t_mean = theta.rolling(window=z_win, min_periods=ou_win // 2).mean()
+    t_std = theta.rolling(window=z_win, min_periods=ou_win // 2).std()
+    z_theta = ((theta - t_mean) / t_std.replace(0, 1e-5)).fillna(0)
+
+    # Sync signals with traded price
+    sync_df = pd.merge_asof(
+        pivot.reset_index().sort_values('datetime'),
+        cos_df[['datetime', 'Price']].sort_values('datetime'),
+        on='datetime', direction='backward',
+    ).set_index('datetime')
+    sync_df['Price'] = sync_df['Price'].ffill()
+    sync_df['Z_Theta'] = z_theta.values
+
+    sync_df['CVD_Regime'] = np.where(sync_df['CVD_BUY'] > sync_df['CVD_SELL'], 1, -1)
+    sync_df['Regime_Change'] = sync_df['CVD_Regime'].diff()
+
+    return sync_df
+
+def simulate_session_trades(sync_df, z_thresh, regime, theta_exit, vel_exit, max_ticks, hysteresis_mult, starting_equity, slippage):
+    """Runs the CVD-regime-change entry / theta-spike-or-momentum exit loop for a single session."""
+    trade_log = []
+    current_equity = starting_equity
+    n = len(sync_df)
+    idx = 0
+
+    while idx < n:
+        row = sync_df.iloc[idx]
+        if row['Regime_Change'] in (2, -2):
+            is_low_theta = row['Z_Theta'] < z_thresh
+            triggered = is_low_theta if regime == 'Trend (Low Theta)' else not is_low_theta
+
+            if triggered:
+                if regime == 'Trend (Low Theta)':
+                    direction = 'Long' if row['Regime_Change'] == 2 else 'Short'
+                else:
+                    direction = 'Short' if row['Regime_Change'] == 2 else 'Long'
+
+                entry_price = row['Price']
+                entry_time = sync_df.index[idx]
+                exit_idx = min(idx + max_ticks, n - 1)
+                exit_reason = f"Max Time ({max_ticks} ticks)"
+
+                lookback_start = max(0, idx - 60)
+                recent_noise = sync_df.iloc[lookback_start:idx]['BUY_Vel'].std()
+                if pd.isna(recent_noise):
+                    recent_noise = 0
+                deadband = recent_noise * hysteresis_mult
+
+                for j in range(idx + 1, min(idx + max_ticks + 1, n)):
+                    er = sync_df.iloc[j]
+                    if theta_exit and er['Z_Theta'] >= z_thresh:
+                        exit_idx = j
+                        exit_reason = "Theta Spike"
+                        break
+                    if vel_exit:
+                        if direction == 'Long' and er['SELL_Vel'] > (er['BUY_Vel'] + deadband):
+                            exit_idx = j
+                            exit_reason = "Momentum Exhaustion"
+                            break
+                        if direction == 'Short' and er['BUY_Vel'] > (er['SELL_Vel'] + deadband):
+                            exit_idx = j
+                            exit_reason = "Momentum Exhaustion"
+                            break
+
+                exit_price = sync_df.iloc[exit_idx]['Price']
+                exit_time = sync_df.index[exit_idx]
+                shares = current_equity / entry_price
+                gross = ((exit_price - entry_price) if direction == 'Long' else (entry_price - exit_price)) * shares
+                net = gross - (shares * slippage * 2)
+                current_equity += net
+                ret_pct = (net / current_equity) * 100
+
+                trade_log.append({
+                    'Entry_Time': entry_time,
+                    'Exit_Time': exit_time,
+                    'Direction': direction,
+                    'Hold_Ticks': exit_idx - idx,
+                    'Entry_Price': round(entry_price, 3),
+                    'Exit_Price': round(exit_price, 3),
+                    'Net_Profit': round(net, 2),
+                    'Return_%': round(ret_pct, 4),
+                    'Exit_Reason': exit_reason,
+                    'Equity_After': round(current_equity, 2),
+                })
+                idx = exit_idx
+        idx += 1
+
+    return trade_log, current_equity
+
+def run_backtest(session_specs, params, progress_callback=None):
+    """Iterates paired Depth+Sales sessions, compounding equity across sessions in chronological order."""
+    trade_log = []
+    current_equity = params['capital']
+    sessions_run = 0
+    total = len(session_specs)
+
+    for i, spec in enumerate(session_specs):
+        if progress_callback:
+            progress_callback(i, total, spec['label'])
+        try:
+            if spec['source'] == 'drive':
+                depth_bytes = download_from_gdrive(spec['depth_id'])
+                sales_bytes = download_from_gdrive(spec['sales_id'])
+            else:
+                depth_bytes = spec['depth_file']
+                sales_bytes = spec['sales_file']
+
+            md_df = load_depth_data(depth_bytes, spec['depth_name'])
+            if md_df is None or md_df.empty:
+                continue
+            trade_date = md_df['datetime'].iloc[0].date()
+            cos_df = load_sales_data(sales_bytes, trade_date, spec['sales_name'])
+            if cos_df is None or cos_df.empty:
+                continue
+
+            md_df = prep_session_frame(md_df)
+            cos_df = prep_session_frame(cos_df)
+            if md_df.empty or cos_df.empty:
+                continue
+
+            sync_df = compute_backtest_signals(
+                cos_df, md_df,
+                params['base_span'], params['vel_lb'], params['smooth_win'], params['ou_win']
+            )
+            session_trades, current_equity = simulate_session_trades(
+                sync_df, params['z_thresh'], params['regime'],
+                params['theta_exit'], params['vel_exit'],
+                params['max_ticks'], params['hysteresis'],
+                current_equity, params['slippage']
+            )
+            for t in session_trades:
+                t['Session'] = spec['label']
+            trade_log.extend(session_trades)
+            sessions_run += 1
+        except Exception as e:
+            st.warning(f"Skipped session {spec['label']}: {e}")
+
+    trades_df = pd.DataFrame(trade_log) if trade_log else pd.DataFrame()
+    return trades_df, sessions_run
+
+def render_backtest_results(trades_df, capital, sessions_run):
+    total = len(trades_df)
+    wins = (trades_df['Net_Profit'] > 0).sum()
+    win_rate = wins / total * 100
+    gp = trades_df[trades_df['Net_Profit'] > 0]['Net_Profit'].sum()
+    gl = abs(trades_df[trades_df['Net_Profit'] < 0]['Net_Profit'].sum())
+    pf = gp / gl if gl else float('inf')
+    avg_hold = trades_df['Hold_Ticks'].mean()
+    final_equity = trades_df['Equity_After'].iloc[-1]
+    net_ret = (final_equity - capital) / capital * 100
+
+    eq = [capital] + trades_df['Equity_After'].tolist()
+    peak = eq[0]
+    max_dd = 0.0
+    for v in eq:
+        if v > peak:
+            peak = v
+        dd = (v - peak) / peak
+        if dd < max_dd:
+            max_dd = dd
+
+    st.subheader("📊 Tearsheet")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Sessions", sessions_run)
+    c1.metric("Trades", total)
+    c2.metric("Win Rate", f"{win_rate:.1f}%")
+    c2.metric("Profit Factor", f"{pf:.2f}" if pf != float('inf') else "∞")
+    c3.metric("Avg Hold", f"{avg_hold:.0f} ticks")
+    c3.metric("Max Drawdown", f"{max_dd*100:.2f}%")
+    c4.metric("Final Equity", f"${final_equity:,.2f}")
+    c4.metric("Net Return", f"{net_ret:+.2f}%")
+
+    ec = trades_df['Exit_Reason'].value_counts()
+    st.caption("Exit Reasons — " + "  ·  ".join(f"{r}: {c}" for r, c in ec.items()))
+
+    eq_fig = go.Figure()
+    eq_fig.add_trace(go.Scatter(
+        x=list(range(len(eq))), y=eq, mode='lines', name='Equity',
+        line=dict(color='dodgerblue', width=2)
+    ))
+    eq_fig.add_hline(y=capital, line=dict(color='gray', width=1, dash='dot'))
+    eq_fig.update_layout(title="Equity Curve", xaxis_title="Trade #", yaxis_title="Equity ($)", height=350, margin=dict(l=40, r=40, t=60, b=40))
+    st.plotly_chart(eq_fig, use_container_width=True)
+
+    st.subheader("📜 Trade Log")
+    display_df = trades_df.copy()
+    display_df['Entry_Time'] = display_df['Entry_Time'].astype(str).str[:19]
+    display_df['Exit_Time'] = display_df['Exit_Time'].astype(str).str[:19]
+    st.dataframe(display_df, use_container_width=True, hide_index=True)
+
+    csv_bytes = trades_df.to_csv(index=False).encode('utf-8')
+    st.download_button(
+        "⬇️ Download Trade Log (CSV)", data=csv_bytes,
+        file_name="Backtest_Trade_Log.csv", mime="text/csv"
+    )
+
+def render_backtesting_tab():
+    st.header("🧪 Signal Backtesting Engine")
+    st.markdown("Replay the CVD-regime / OU-theta strategy across one or more historical sessions.")
+
+    session_specs = []
+
+    with st.expander("📂 Backtest Data Source", expanded=True):
+        bt_source = st.radio("Data Source", ["Google Drive Sessions", "Manual File Upload"], horizontal=True)
+
+        if bt_source == "Google Drive Sessions":
+            depth_files = st.session_state.get('depth_files', {})
+            sales_files = st.session_state.get('sales_files', {})
+            ticker_name = st.session_state.get('bt_ticker_name', 'Unknown')
+
+            if not depth_files or not sales_files:
+                st.warning("Select a Ticker with both Depth and Sales files in the 'Session Database' sidebar panel first.")
+            else:
+                valid_dates = []
+                for fname in depth_files.keys():
+                    m = re.match(r'^(\d{8})', fname)
+                    if m:
+                        date = m.group(1)
+                        if date not in valid_dates and any(f.startswith(date) for f in sales_files.keys()):
+                            valid_dates.append(date)
+                valid_dates = sorted(valid_dates)
+
+                if not valid_dates:
+                    st.warning(f"No paired Depth + Sales sessions found for {ticker_name}.")
+                else:
+                    selected_dates = st.multiselect(
+                        f"Sessions to backtest ({ticker_name}, {len(valid_dates)} available):",
+                        options=valid_dates, default=valid_dates,
+                        format_func=lambda d: f"{d[:4]}-{d[4:6]}-{d[6:]}"
+                    )
+                    for date in selected_dates:
+                        depth_name = next(f for f in depth_files if f.startswith(date))
+                        sales_name = next(f for f in sales_files if f.startswith(date))
+                        session_specs.append({
+                            'label': date, 'source': 'drive',
+                            'depth_id': depth_files[depth_name], 'depth_name': depth_name,
+                            'sales_id': sales_files[sales_name], 'sales_name': sales_name,
+                        })
+        else:
+            bt_depth_uploads = st.file_uploader("Upload Market Depth files", type=["csv", "parquet"], accept_multiple_files=True, key="bt_depth_up")
+            bt_sales_uploads = st.file_uploader("Upload Course of Sales files", type=["csv", "parquet"], accept_multiple_files=True, key="bt_sales_up")
+
+            if bt_depth_uploads and bt_sales_uploads:
+                depth_by_date = {}
+                for f in bt_depth_uploads:
+                    m = re.match(r'^(\d{8})', f.name)
+                    depth_by_date[m.group(1) if m else f.name] = f
+                sales_by_date = {}
+                for f in bt_sales_uploads:
+                    m = re.match(r'^(\d{8})', f.name)
+                    sales_by_date[m.group(1) if m else f.name] = f
+
+                common_dates = sorted(set(depth_by_date) & set(sales_by_date))
+                if not common_dates:
+                    st.warning("Could not match uploaded Depth/Sales files by a common YYYYMMDD date prefix. Rename files accordingly.")
+                else:
+                    selected_dates = st.multiselect("Sessions to backtest:", options=common_dates, default=common_dates)
+                    for date in selected_dates:
+                        session_specs.append({
+                            'label': date, 'source': 'upload',
+                            'depth_file': depth_by_date[date], 'depth_name': depth_by_date[date].name,
+                            'sales_file': sales_by_date[date], 'sales_name': sales_by_date[date].name,
+                        })
+
+    st.markdown("#### ⚙️ Strategy Parameters")
+    p1, p2 = st.columns(2)
+    with p1:
+        st.markdown("**Signal Parameters**")
+        bt_base_span = st.number_input("Base EMA Span", 1, 200, 15, key="bt_base_span")
+        bt_vel_lb = st.number_input("Vel Lookback", 1, 60, 5, key="bt_vel_lb")
+        bt_smooth_win = st.number_input("Smooth Window", 1, 60, 10, key="bt_smooth_win")
+    with p2:
+        st.markdown("**Regime Filter**")
+        bt_ou_win = st.number_input("OU Window", 10, 720, 120, step=10, key="bt_ou_win")
+        bt_z_thresh = st.number_input("Z Threshold", 0.1, 5.0, 1.0, step=0.1, key="bt_z_thresh")
+        bt_regime = st.selectbox("Trade Regime", ["Trend (Low Theta)", "Fade Trap (High Theta)"], key="bt_regime")
+
+    st.markdown("**Exit Logic**")
+    e1, e2, e3, e4 = st.columns(4)
+    with e1:
+        bt_theta_exit = st.checkbox("Exit on Theta Spike", value=True, key="bt_theta_exit")
+    with e2:
+        bt_vel_exit = st.checkbox("Exit on Vel Cross", value=False, key="bt_vel_exit")
+    with e3:
+        bt_max_ticks = st.number_input("Max Hold Ticks", 1, 500, 40, key="bt_max_ticks")
+    with e4:
+        bt_hysteresis = st.number_input("Hysteresis", 0.0, 2.0, 0.6, step=0.1, key="bt_hysteresis")
+
+    st.markdown("**Portfolio**")
+    po1, po2 = st.columns(2)
+    with po1:
+        bt_capital = st.number_input("Initial Capital ($)", 1000, 10_000_000, 10000, step=1000, key="bt_capital")
+    with po2:
+        bt_slippage = st.number_input("Slippage / Share ($)", 0.0, 0.1, 0.005, step=0.001, format="%.3f", key="bt_slippage")
+
+    st.markdown("---")
+    run_clicked = st.button("▶️ Run Backtest", type="primary", disabled=not session_specs)
+
+    if run_clicked:
+        params = {
+            'base_span': bt_base_span, 'vel_lb': bt_vel_lb, 'smooth_win': bt_smooth_win,
+            'ou_win': bt_ou_win, 'z_thresh': bt_z_thresh, 'regime': bt_regime,
+            'theta_exit': bt_theta_exit, 'vel_exit': bt_vel_exit,
+            'max_ticks': bt_max_ticks, 'hysteresis': bt_hysteresis,
+            'capital': bt_capital, 'slippage': bt_slippage,
+        }
+        progress_bar = st.progress(0, text="Starting backtest...")
+
+        def _progress(i, total, label):
+            progress_bar.progress((i + 1) / total, text=f"Processing {label} ({i + 1}/{total})...")
+
+        with st.spinner("Running backtest..."):
+            trades_df, sessions_run = run_backtest(session_specs, params, progress_callback=_progress)
+        progress_bar.empty()
+
+        st.session_state['bt_trades_df'] = trades_df
+        st.session_state['bt_sessions_run'] = sessions_run
+        st.session_state['bt_capital_used'] = bt_capital
+
+        if trades_df.empty:
+            st.info(f"Done — {sessions_run} session(s) processed, but no trades were generated with these parameters.")
+
+    trades_df = st.session_state.get('bt_trades_df')
+    if trades_df is not None and not trades_df.empty:
+        render_backtest_results(trades_df, st.session_state.get('bt_capital_used', bt_capital), st.session_state.get('bt_sessions_run', 0))
 
 # --- Streamlit App UI ---
 st.title("📈 Interactive Trade Session Analysis Tool")
@@ -745,6 +1112,11 @@ with st.sidebar.expander("Session Database", expanded=True):
             # Filter for Depth vs Sales
             depth_files = {k: v for k, v in files_dict.items() if "Depth" in k}
             sales_files = {k: v for k, v in files_dict.items() if any(x in k for x in ["Sales", "sales"])}
+
+            # Persist so other sections (e.g. Backtesting) can discover paired sessions
+            st.session_state['depth_files'] = depth_files
+            st.session_state['sales_files'] = sales_files
+            st.session_state['bt_ticker_name'] = selected_ticker
 
             # Dropdowns for specific files
             depth_choice = st.selectbox("Market Depth File", options=["None"] + sorted(depth_files.keys(), reverse=True))
@@ -815,7 +1187,7 @@ if df_depth is not None and not df_depth.empty:
 st.sidebar.subheader("Analysis Options")
 analysis_type = st.sidebar.selectbox(
     "Select Analysis Type",
-    ["Hourly Volume Analysis", "Volume Profile", "Hourly Volume Distribution", "Market Depth Explorer"]
+    ["Hourly Volume Analysis", "Volume Profile", "Hourly Volume Distribution", "Market Depth Explorer", "Backtesting"]
 )
 
 # Global Price Bin Size (Consolidated)
@@ -974,6 +1346,9 @@ if analysis_type == "Market Depth Explorer":
 
     else:
         st.warning("Please upload BOTH a Market Depth CSV and Course of Sales CSV to unlock the Market Depth Explorer features.")
+
+elif analysis_type == "Backtesting":
+    render_backtesting_tab()
 
 elif df_sales is not None:
     st.sidebar.subheader("⏳ Time Filter (Sales Data)")
