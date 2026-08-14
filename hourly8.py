@@ -1238,6 +1238,19 @@ def render_signal_explorer_tab(df_depth, df_sales):
             include_spatial=True, tick_size=se_tick_size,
             touch_ticks=se_touch_ticks, core_ticks=se_core_ticks, deep_ticks=se_deep_ticks,
         )
+
+        # Session-cumulative VWAP, synced onto the same tick grid as the signals
+        cos_vwap = cos_df.sort_values('datetime').copy()
+        cos_vwap['Cum_Vol'] = cos_vwap['Volume'].cumsum()
+        cos_vwap['Cum_PV'] = (cos_vwap['Price'] * cos_vwap['Volume']).cumsum()
+        cos_vwap['VWAP'] = cos_vwap['Cum_PV'] / cos_vwap['Cum_Vol'].replace(0, 1)
+        sync_df = pd.merge_asof(
+            sync_df.reset_index().sort_values('datetime'),
+            cos_vwap[['datetime', 'VWAP']],
+            on='datetime', direction='backward',
+        ).set_index('datetime')
+        sync_df['VWAP'] = sync_df['VWAP'].ffill()
+
         trades, final_equity = simulate_session_trades(
             sync_df, se_z_thresh, se_regime, se_theta_exit, se_vel_exit,
             se_max_ticks, se_hysteresis, se_capital, se_slippage
@@ -1281,9 +1294,11 @@ def render_signal_explorer_tab(df_depth, df_sales):
         specs=[[{}], [{}], [{}], [{}], [{"secondary_y": True}]],
     )
 
-    # Row 1: Price + trade markers + trade-window shading
+    # Row 1: Price + VWAP + trade markers + trade-window shading
     fig.add_trace(go.Scatter(x=sync_df.index, y=sync_df['Price'], name="Price",
                               line=dict(color='black', width=1.3)), row=1, col=1)
+    fig.add_trace(go.Scatter(x=sync_df.index, y=sync_df['VWAP'], name="VWAP",
+                              line=dict(color='darkorange', width=1.6, dash='dot')), row=1, col=1)
 
     exit_colors = {"Theta Spike": "#8e44ad", "Momentum Exhaustion": "#e67e22"}
     for tr in trades:
