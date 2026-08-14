@@ -1282,16 +1282,17 @@ def render_signal_explorer_tab(df_depth, df_sales):
 
     # --- Multi-panel figure ---
     fig = make_subplots(
-        rows=5, cols=1, shared_xaxes=True, vertical_spacing=0.03,
+        rows=6, cols=1, shared_xaxes=True, vertical_spacing=0.03,
         subplot_titles=(
             "Traded Price",
             "Smoothed Level Counts (Total Book)",
             "Spatial CVD — Core + Deep Structural Thrust",
             f"Standard CVD ({se_smooth_alg}) — Entries / Rejections",
             "Regime Classifier: OU Decay Rate (θ) & Z-Score",
+            "Cumulative P&L",
         ),
-        row_heights=[0.24, 0.14, 0.16, 0.22, 0.24],
-        specs=[[{}], [{}], [{}], [{}], [{"secondary_y": True}]],
+        row_heights=[0.20, 0.12, 0.14, 0.18, 0.18, 0.18],
+        specs=[[{}], [{}], [{}], [{}], [{"secondary_y": True}], [{}]],
     )
 
     # Row 1: Price + VWAP + trade markers + trade-window shading
@@ -1383,8 +1384,29 @@ def render_signal_explorer_tab(df_depth, df_sales):
     fig.add_hline(y=se_z_thresh, line=dict(color='#bf616a', width=1, dash='dash'),
                   row=5, col=1, secondary_y=True)
 
+    # Row 6: Cumulative P&L (step chart, one step per trade exit)
+    session_start = sync_df.index[0]
+    session_end = sync_df.index[-1]
+    pnl_times = [session_start]
+    pnl_values = [0.0]
+    running = 0.0
+    for tr in trades:
+        running += tr['Net_Profit']
+        pnl_times.append(tr['Exit_Time'])
+        pnl_values.append(running)
+    pnl_times.append(session_end)
+    pnl_values.append(running)
+
+    pnl_fill = 'rgba(163, 190, 140, 0.25)' if running >= 0 else 'rgba(191, 97, 106, 0.2)'
+    fig.add_trace(go.Scatter(
+        x=pnl_times, y=pnl_values, name="Cumulative P&L", mode='lines',
+        line=dict(color='#2e3440', width=1.6, shape='hv'),
+        fill='tozeroy', fillcolor=pnl_fill,
+    ), row=6, col=1)
+    fig.add_hline(y=0, line=dict(color='gray', width=0.7), row=6, col=1)
+
     fig.update_layout(
-        height=1150, hovermode="x unified", template="plotly_white",
+        height=1350, hovermode="x unified", template="plotly_white",
         legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1),
         margin=dict(l=40, r=40, t=60, b=40),
     )
@@ -1394,6 +1416,7 @@ def render_signal_explorer_tab(df_depth, df_sales):
     fig.update_yaxes(title_text="CVD", row=4, col=1)
     fig.update_yaxes(title_text="OU θ", row=5, col=1, secondary_y=False)
     fig.update_yaxes(title_text=f"Z-θ (thresh={se_z_thresh:.1f})", row=5, col=1, secondary_y=True)
+    fig.update_yaxes(title_text="Cum P&L ($)", row=6, col=1)
 
     st.plotly_chart(fig, use_container_width=True, theme=None)
 
