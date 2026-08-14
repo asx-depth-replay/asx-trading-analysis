@@ -730,8 +730,33 @@ def prep_session_frame(df, start='10:00:00', end='16:00:00'):
         return df
     return df.set_index('datetime').between_time(start, end).reset_index().sort_values('datetime')
 
-def compute_backtest_signals(cos_df, md_df, base_span, vel_lb, smooth_win, ou_win):
-    """Builds the per-tick signal frame: order-book level velocity, DEMA CVD, and OU theta/Z-score regime."""
+def apply_smoothing(series, alg, s_win, thresh=5):
+    """Shared velocity-smoothing step — matches the live heatmap's _smooth_vel exactly."""
+    if alg == 'EMA':
+        return series.ewm(span=s_win, adjust=False).mean()
+    elif alg == 'SMA':
+        return series.rolling(window=s_win, min_periods=1).mean()
+    elif alg == 'DEMA':
+        e1 = series.ewm(span=s_win, adjust=False).mean()
+        e2 = e1.ewm(span=s_win, adjust=False).mean()
+        return (2 * e1) - e2
+    else:  # Threshold
+        gated = series.apply(lambda x: x if abs(x) >= thresh else 0.0)
+        return gated.ewm(span=3, adjust=False).mean()
+
+def compute_signal_frame(cos_df, md_df, base_span, vel_lb, smooth_win, ou_win,
+                          smooth_alg='DEMA', smooth_thresh=5,
+                          include_spatial=False, tick_size=0.01,
+                          touch_ticks=5, core_ticks=15, deep_ticks=35):
+    """
+    Builds the per-tick signal frame: order-book level velocity, CVD, and OU theta/Z-score regime.
+    With include_spatial=True, also adds Touch/Core/Deep zone density and the Core+Deep
+    "structural" spatial CVD (Spatial_CVD_BUY/SELL) used by the Signal Explorer.
+
+    The total-book pipeline (through Z_Theta/Regime_Change) is numerically identical to the
+    original Backtesting-only implementation when called with defaults — existing backtest
+    results are unaffected.
+    """
     lc = md_df.groupby(['datetime', 'Type'])['Price'].nunique().reset_index()
     pivot = lc.pivot(index='datetime', columns='Type', values='Price').fillna(0)
     for col in ['BUY', 'SELL']:
@@ -740,17 +765,15 @@ def compute_backtest_signals(cos_df, md_df, base_span, vel_lb, smooth_win, ou_wi
 
     b_ema = pivot['BUY'].ewm(span=base_span, adjust=False).mean()
     s_ema = pivot['SELL'].ewm(span=base_span, adjust=False).mean()
+    pivot['BUY_EMA'] = b_ema
+    pivot['SELL_EMA'] = s_ema
     b_vel_raw = b_ema.diff(periods=vel_lb).fillna(0)
     s_vel_raw = s_ema.diff(periods=vel_lb).fillna(0)
 
-    b_e1 = b_vel_raw.ewm(span=smooth_win, adjust=False).mean()
-    b_e2 = b_e1.ewm(span=smooth_win, adjust=False).mean()
-    pivot['BUY_Vel'] = (2 * b_e1) - b_e2
+    pivot['BUY_Vel'] = apply_smoothing(b_vel_raw, smooth_alg, smooth_win, smooth_thresh)
     pivot['CVD_BUY'] = pivot['BUY_Vel'].cumsum()
 
-    s_e1 = s_vel_raw.ewm(span=smooth_win, adjust=False).mean()
-    s_e2 = s_e1.ewm(span=smooth_win, adjust=False).mean()
-    pivot['SELL_Vel'] = (2 * s_e1) - s_e2
+    pivot['SELL_Vel'] = apply_smoothing(s_vel_raw, smooth_alg, smooth_win, smooth_thresh)
     pivot['CVD_SELL'] = pivot['SELL_Vel'].cumsum()
 
     # OU theta + Z-score regime filter
@@ -766,6 +789,46 @@ def compute_backtest_signals(cos_df, md_df, base_span, vel_lb, smooth_win, ou_wi
     t_std = theta.rolling(window=z_win, min_periods=ou_win // 2).std()
     z_theta = ((theta - t_mean) / t_std.replace(0, 1e-5)).fillna(0)
 
+    if include_spatial:
+        bids = md_df[md_df['Type'] == 'BUY'].groupby('datetime')['Price'].max().rename('Best_Bid')
+        asks = md_df[md_df['Type'] == 'SELL'].groupby('datetime')['Price'].min().rename('Best_Ask')
+        mids = ((bids + asks) / 2).rename('Mid_Price')
+
+        md_spatial = md_df.merge(mids, on='datetime', how='left')
+        md_spatial['Tick_Distance'] = (
+            (abs(md_spatial['Price'] - md_spatial['Mid_Price']) / tick_size).round().fillna(0).astype(int)
+        )
+        md_spatial['Zone'] = pd.cut(
+            md_spatial['Tick_Distance'], bins=[-1, touch_ticks, core_ticks, deep_ticks],
+            labels=['Touch', 'Core', 'Deep']
+        )
+
+        spatial_counts = (
+            md_spatial.groupby(['datetime', 'Type', 'Zone'], observed=False)['Price']
+            .nunique().unstack(level=['Type', 'Zone'])
+        )
+        spatial_counts.columns = [f"{side}_{zone}_Density" for side, zone in spatial_counts.columns]
+
+        pivot = pivot.join(spatial_counts, how='left').fillna(0)
+        for side in ['BUY', 'SELL']:
+            for zone in ['Touch', 'Core', 'Deep']:
+                col = f"{side}_{zone}_Density"
+                if col not in pivot.columns:
+                    pivot[col] = 0
+
+        pivot['BUY_Structural'] = pivot['BUY_Core_Density'] + pivot['BUY_Deep_Density']
+        pivot['SELL_Structural'] = pivot['SELL_Core_Density'] + pivot['SELL_Deep_Density']
+
+        b_struct_ema = pivot['BUY_Structural'].ewm(span=base_span, adjust=False).mean()
+        s_struct_ema = pivot['SELL_Structural'].ewm(span=base_span, adjust=False).mean()
+        b_struct_vel_raw = b_struct_ema.diff(periods=vel_lb).fillna(0)
+        s_struct_vel_raw = s_struct_ema.diff(periods=vel_lb).fillna(0)
+
+        pivot['BUY_Spatial_Vel'] = apply_smoothing(b_struct_vel_raw, smooth_alg, smooth_win, smooth_thresh)
+        pivot['SELL_Spatial_Vel'] = apply_smoothing(s_struct_vel_raw, smooth_alg, smooth_win, smooth_thresh)
+        pivot['Spatial_CVD_BUY'] = pivot['BUY_Spatial_Vel'].cumsum()
+        pivot['Spatial_CVD_SELL'] = pivot['SELL_Spatial_Vel'].cumsum()
+
     # Sync signals with traded price
     sync_df = pd.merge_asof(
         pivot.reset_index().sort_values('datetime'),
@@ -773,12 +836,38 @@ def compute_backtest_signals(cos_df, md_df, base_span, vel_lb, smooth_win, ou_wi
         on='datetime', direction='backward',
     ).set_index('datetime')
     sync_df['Price'] = sync_df['Price'].ffill()
+    sync_df['OU_Theta'] = theta.values
     sync_df['Z_Theta'] = z_theta.values
 
     sync_df['CVD_Regime'] = np.where(sync_df['CVD_BUY'] > sync_df['CVD_SELL'], 1, -1)
     sync_df['Regime_Change'] = sync_df['CVD_Regime'].diff()
 
     return sync_df
+
+def find_regime_flip_events(sync_df, z_thresh, regime):
+    """
+    Every CVD regime flip in the session, classified exactly like simulate_session_trades'
+    own entry gate: theta-accepted (would enter, direction included) vs theta-rejected.
+    Used to overlay "signal fired but was filtered out" markers alongside real trades.
+    """
+    events = []
+    flips = sync_df.index[sync_df['Regime_Change'].isin([2, -2])]
+    for t in flips:
+        row = sync_df.loc[t]
+        z = row['Z_Theta']
+        is_low_theta = z < z_thresh
+        accepted = is_low_theta if regime == 'Trend (Low Theta)' else not is_low_theta
+
+        direction = None
+        if accepted:
+            if regime == 'Trend (Low Theta)':
+                direction = 'Long' if row['Regime_Change'] == 2 else 'Short'
+            else:
+                direction = 'Short' if row['Regime_Change'] == 2 else 'Long'
+
+        events.append({'time': t, 'direction': direction, 'z_theta': z, 'accepted': accepted})
+
+    return events
 
 def simulate_session_trades(sync_df, z_thresh, regime, theta_exit, vel_exit, max_ticks, hysteresis_mult, starting_equity, slippage):
     """Runs the CVD-regime-change entry / theta-spike-or-momentum exit loop for a single session."""
@@ -882,7 +971,7 @@ def run_backtest(session_specs, params, progress_callback=None):
             if md_df.empty or cos_df.empty:
                 continue
 
-            sync_df = compute_backtest_signals(
+            sync_df = compute_signal_frame(
                 cos_df, md_df,
                 params['base_span'], params['vel_lb'], params['smooth_win'], params['ou_win']
             )
@@ -1091,6 +1180,221 @@ def render_backtesting_tab():
     if trades_df is not None and not trades_df.empty:
         render_backtest_results(trades_df, st.session_state.get('bt_capital_used', bt_capital), st.session_state.get('bt_sessions_run', 0))
 
+# --- Signal Explorer (Single-Session Signal Replay) ---
+
+def render_signal_explorer_tab(df_depth, df_sales):
+    st.header("🔬 Signal Explorer")
+    st.markdown("Replay this session's signals tick-by-tick and see exactly what triggered each position open/close.")
+
+    st.markdown("#### ⚙️ Strategy Parameters")
+    p1, p2, p3 = st.columns(3)
+    with p1:
+        st.markdown("**Signal Parameters**")
+        se_base_span = st.number_input("Base EMA Span", 1, 200, 15, key="se_base_span")
+        se_vel_lb = st.number_input("Vel Lookback", 1, 60, 5, key="se_vel_lb")
+        se_smooth_alg = st.selectbox("Smoothing Algorithm", ["DEMA", "EMA", "SMA", "Threshold"], key="se_smooth_alg")
+        se_smooth_win = st.number_input("Smoothing Window", 1, 60, 10, key="se_smooth_win")
+        se_thresh = st.number_input("Shock Threshold", 1, 50, 5, key="se_thresh", disabled=(se_smooth_alg != "Threshold"))
+    with p2:
+        st.markdown("**Regime Filter**")
+        se_ou_win = st.number_input("OU Window (ticks)", 10, 720, 120, step=10, key="se_ou_win")
+        se_z_thresh = st.number_input("Z Threshold", 0.1, 5.0, 1.0, step=0.1, key="se_z_thresh")
+        se_regime = st.selectbox("Trade Regime", ["Trend (Low Theta)", "Fade Trap (High Theta)"], key="se_regime")
+    with p3:
+        st.markdown("**Spatial Zones**")
+        se_tick_size = st.number_input("Tick Size ($)", 0.001, 1.0, 0.01, step=0.001, format="%.3f", key="se_tick_size")
+        se_touch_ticks = st.number_input("Touch Zone Max", 1, 20, 5, key="se_touch_ticks")
+        se_core_ticks = st.number_input("Core Zone Max", 5, 60, 15, key="se_core_ticks")
+        se_deep_ticks = st.number_input("Deep Zone Max", 15, 100, 35, key="se_deep_ticks")
+
+    st.markdown("**Exit Logic** (defines the shaded trade windows below)")
+    e1, e2, e3, e4 = st.columns(4)
+    with e1:
+        se_theta_exit = st.checkbox("Exit on Theta Spike", value=True, key="se_theta_exit")
+    with e2:
+        se_vel_exit = st.checkbox("Exit on Vel Cross", value=False, key="se_vel_exit")
+    with e3:
+        se_max_ticks = st.number_input("Max Hold Ticks", 1, 500, 40, key="se_max_ticks")
+    with e4:
+        se_hysteresis = st.number_input("Hysteresis", 0.0, 2.0, 0.6, step=0.1, key="se_hysteresis")
+
+    st.markdown("**Portfolio**")
+    po1, po2 = st.columns(2)
+    with po1:
+        se_capital = st.number_input("Initial Capital ($)", 1000, 10_000_000, 10000, step=1000, key="se_capital")
+    with po2:
+        se_slippage = st.number_input("Slippage / Share ($)", 0.0, 0.1, 0.005, step=0.001, format="%.3f", key="se_slippage")
+
+    md_df = prep_session_frame(df_depth)
+    cos_df = prep_session_frame(df_sales)
+    if md_df is None or md_df.empty or cos_df is None or cos_df.empty:
+        st.warning("No data in the standard 10:00–16:00 session window for this file.")
+        return
+
+    with st.spinner("Computing signals..."):
+        sync_df = compute_signal_frame(
+            cos_df, md_df, se_base_span, se_vel_lb, se_smooth_win, se_ou_win,
+            smooth_alg=se_smooth_alg, smooth_thresh=se_thresh,
+            include_spatial=True, tick_size=se_tick_size,
+            touch_ticks=se_touch_ticks, core_ticks=se_core_ticks, deep_ticks=se_deep_ticks,
+        )
+        trades, final_equity = simulate_session_trades(
+            sync_df, se_z_thresh, se_regime, se_theta_exit, se_vel_exit,
+            se_max_ticks, se_hysteresis, se_capital, se_slippage
+        )
+        trades_df = pd.DataFrame(trades)
+        events = find_regime_flip_events(sync_df, se_z_thresh, se_regime)
+
+    executed_entry_times = set(trades_df['Entry_Time']) if not trades_df.empty else set()
+
+    st.markdown("---")
+    total_trades = len(trades_df)
+    if total_trades:
+        wins = (trades_df['Net_Profit'] > 0).sum()
+        net_pnl = trades_df['Net_Profit'].sum()
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Trades", total_trades)
+        c2.metric("Win Rate", f"{wins / total_trades * 100:.1f}%")
+        c3.metric("Net P/L", f"${net_pnl:+,.2f}")
+        c4.metric("Final Equity", f"${final_equity:,.2f}")
+    else:
+        st.info("No trades were generated for this session with these parameters.")
+
+    rejected_n = sum(1 for e in events if not e['accepted'])
+    skipped_n = sum(1 for e in events if e['accepted'] and e['time'] not in executed_entry_times)
+    st.caption(
+        f"Regime flips this session: {len(events)}  ·  Executed: {total_trades}  ·  "
+        f"Filtered by theta gate: {rejected_n}  ·  Accepted but already in a position: {skipped_n}"
+    )
+
+    # --- Multi-panel figure ---
+    fig = make_subplots(
+        rows=5, cols=1, shared_xaxes=True, vertical_spacing=0.03,
+        subplot_titles=(
+            "Traded Price",
+            "Smoothed Level Counts (Total Book)",
+            "Spatial CVD — Core + Deep Structural Thrust",
+            f"Standard CVD ({se_smooth_alg}) — Entries / Rejections",
+            "Regime Classifier: OU Decay Rate (θ) & Z-Score",
+        ),
+        row_heights=[0.24, 0.14, 0.16, 0.22, 0.24],
+        specs=[[{}], [{}], [{}], [{}], [{"secondary_y": True}]],
+    )
+
+    # Row 1: Price + trade markers + trade-window shading
+    fig.add_trace(go.Scatter(x=sync_df.index, y=sync_df['Price'], name="Price",
+                              line=dict(color='black', width=1.3)), row=1, col=1)
+
+    exit_colors = {"Theta Spike": "#8e44ad", "Momentum Exhaustion": "#e67e22"}
+    for tr in trades:
+        color = "#2ecc71" if tr['Direction'] == 'Long' else "#e74c3c"
+        symbol = "triangle-up" if tr['Direction'] == 'Long' else "triangle-down"
+        fig.add_trace(go.Scatter(
+            x=[tr['Entry_Time']], y=[tr['Entry_Price']], mode='markers',
+            marker=dict(symbol=symbol, size=11, color=color, line=dict(color='black', width=0.5)),
+            name=f"{tr['Direction']} Entry", showlegend=False,
+            hovertext=f"{tr['Direction']} Entry<br>{tr['Entry_Time']}<br>${tr['Entry_Price']:.3f}",
+            hoverinfo='text',
+        ), row=1, col=1)
+        exit_reason_key = tr['Exit_Reason'].split(' (')[0]
+        exit_color = exit_colors.get(exit_reason_key, "#7f8c8d")
+        fig.add_trace(go.Scatter(
+            x=[tr['Exit_Time']], y=[tr['Exit_Price']], mode='markers',
+            marker=dict(symbol='x', size=9, color=exit_color, line=dict(width=1.5)),
+            name="Exit", showlegend=False,
+            hovertext=f"Exit — {tr['Exit_Reason']}<br>{tr['Exit_Time']}<br>${tr['Exit_Price']:.3f}<br>Net: ${tr['Net_Profit']:+,.2f}",
+            hoverinfo='text',
+        ), row=1, col=1)
+        fig.add_vrect(x0=tr['Entry_Time'], x1=tr['Exit_Time'], fillcolor=color, opacity=0.08, line_width=0, row=1, col=1)
+        fig.add_vrect(x0=tr['Entry_Time'], x1=tr['Exit_Time'], fillcolor=color, opacity=0.08, line_width=0, row=4, col=1)
+
+    # Row 2: Smoothed level counts
+    fig.add_trace(go.Scatter(x=sync_df.index, y=sync_df['BUY_EMA'], name="BUY Levels",
+                              line=dict(color='#5e81ac', width=1.2)), row=2, col=1)
+    fig.add_trace(go.Scatter(x=sync_df.index, y=sync_df['SELL_EMA'], name="SELL Levels",
+                              line=dict(color='#bf616a', width=1.2)), row=2, col=1)
+
+    # Row 3: Spatial CVD (Core + Deep)
+    fig.add_trace(go.Scatter(x=sync_df.index, y=sync_df['Spatial_CVD_BUY'], name="Spatial CVD BUY",
+                              line=dict(color='#88c0d0', width=1.4)), row=3, col=1)
+    fig.add_trace(go.Scatter(x=sync_df.index, y=sync_df['Spatial_CVD_SELL'], name="Spatial CVD SELL",
+                              line=dict(color='#d08770', width=1.4, dash='dot')), row=3, col=1)
+    fig.add_hline(y=0, line=dict(color='gray', width=0.7), row=3, col=1)
+
+    # Row 4: Standard CVD + entry/rejection markers
+    fig.add_trace(go.Scatter(x=sync_df.index, y=sync_df['CVD_BUY'], name="CVD BUY",
+                              line=dict(color='#a3be8c', width=1.2)), row=4, col=1)
+    fig.add_trace(go.Scatter(x=sync_df.index, y=sync_df['CVD_SELL'], name="CVD SELL",
+                              line=dict(color='#d08770', width=1.2)), row=4, col=1)
+    fig.add_hline(y=0, line=dict(color='gray', width=0.7), row=4, col=1)
+
+    cvd_mid = (sync_df['CVD_BUY'] + sync_df['CVD_SELL']) / 2
+    long_x, long_y, short_x, short_y = [], [], [], []
+    rejected_x, rejected_y, skipped_x, skipped_y = [], [], [], []
+    for e in events:
+        t = e['time']
+        if t not in cvd_mid.index:
+            continue
+        y = cvd_mid.loc[t]
+        if not e['accepted']:
+            rejected_x.append(t); rejected_y.append(y)
+        elif t in executed_entry_times:
+            if e['direction'] == 'Long':
+                long_x.append(t); long_y.append(y)
+            else:
+                short_x.append(t); short_y.append(y)
+        else:
+            skipped_x.append(t); skipped_y.append(y)
+
+    if long_x:
+        fig.add_trace(go.Scatter(x=long_x, y=long_y, mode='markers', name='Long entry (executed)',
+                                  marker=dict(symbol='triangle-up', size=10, color='#a3be8c')), row=4, col=1)
+    if short_x:
+        fig.add_trace(go.Scatter(x=short_x, y=short_y, mode='markers', name='Short entry (executed)',
+                                  marker=dict(symbol='triangle-down', size=10, color='#bf616a')), row=4, col=1)
+    if skipped_x:
+        fig.add_trace(go.Scatter(x=skipped_x, y=skipped_y, mode='markers', name='Accepted (already in position)',
+                                  marker=dict(symbol='circle-open', size=8, color='#4c566a')), row=4, col=1)
+    if rejected_x:
+        fig.add_trace(go.Scatter(x=rejected_x, y=rejected_y, mode='markers', name='Rejected (theta gate)',
+                                  marker=dict(symbol='x', size=7, color='#4c566a')), row=4, col=1)
+
+    # Row 5: OU theta (primary) + Z-theta (secondary)
+    fig.add_trace(go.Scatter(x=sync_df.index, y=sync_df['OU_Theta'], name="OU θ (raw)",
+                              line=dict(color='#b48ead', width=1.0), fill='tozeroy',
+                              fillcolor='rgba(180, 142, 173, 0.2)'), row=5, col=1, secondary_y=False)
+    fig.add_trace(go.Scatter(x=sync_df.index, y=sync_df['Z_Theta'], name="Z-θ",
+                              line=dict(color='#2e3440', width=1.0, dash='dot')), row=5, col=1, secondary_y=True)
+    fig.add_hline(y=se_z_thresh, line=dict(color='#bf616a', width=1, dash='dash'),
+                  row=5, col=1, secondary_y=True)
+
+    fig.update_layout(
+        height=1150, hovermode="x unified", template="plotly_white",
+        legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1),
+        margin=dict(l=40, r=40, t=60, b=40),
+    )
+    fig.update_yaxes(title_text="Price ($)", row=1, col=1)
+    fig.update_yaxes(title_text="Levels", row=2, col=1)
+    fig.update_yaxes(title_text="Spatial CVD", row=3, col=1)
+    fig.update_yaxes(title_text="CVD", row=4, col=1)
+    fig.update_yaxes(title_text="OU θ", row=5, col=1, secondary_y=False)
+    fig.update_yaxes(title_text=f"Z-θ (thresh={se_z_thresh:.1f})", row=5, col=1, secondary_y=True)
+
+    st.plotly_chart(fig, use_container_width=True, theme=None)
+
+    if total_trades:
+        st.subheader("📜 Trade Log (this session)")
+        display_df = trades_df.copy()
+        display_df['Entry_Time'] = display_df['Entry_Time'].astype(str).str[:19]
+        display_df['Exit_Time'] = display_df['Exit_Time'].astype(str).str[:19]
+        st.dataframe(display_df, use_container_width=True, hide_index=True)
+
+        csv_bytes = trades_df.to_csv(index=False).encode('utf-8')
+        st.download_button(
+            "⬇️ Download Trade Log (CSV)", data=csv_bytes,
+            file_name="Signal_Explorer_Trade_Log.csv", mime="text/csv", key="se_csv_dl"
+        )
+
 # --- Streamlit App UI ---
 st.title("📈 Interactive Trade Session Analysis Tool")
 
@@ -1190,7 +1494,7 @@ if df_depth is not None and not df_depth.empty:
 st.sidebar.subheader("Analysis Options")
 analysis_type = st.sidebar.selectbox(
     "Select Analysis Type",
-    ["Hourly Volume Analysis", "Volume Profile", "Hourly Volume Distribution", "Market Depth Explorer", "Backtesting"]
+    ["Hourly Volume Analysis", "Volume Profile", "Hourly Volume Distribution", "Market Depth Explorer", "Backtesting", "Signal Explorer"]
 )
 
 # Global Price Bin Size (Consolidated)
@@ -1352,6 +1656,12 @@ if analysis_type == "Market Depth Explorer":
 
 elif analysis_type == "Backtesting":
     render_backtesting_tab()
+
+elif analysis_type == "Signal Explorer":
+    if df_depth is not None and not df_depth.empty and df_sales is not None and not df_sales.empty:
+        render_signal_explorer_tab(df_depth, df_sales)
+    else:
+        st.warning("Please upload BOTH a Market Depth CSV and Course of Sales CSV to unlock the Signal Explorer.")
 
 elif df_sales is not None:
     st.sidebar.subheader("⏳ Time Filter (Sales Data)")
