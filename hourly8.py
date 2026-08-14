@@ -930,6 +930,7 @@ def simulate_session_trades(sync_df, z_thresh, regime, theta_exit, vel_exit, max
                     'Hold_Ticks': exit_idx - idx,
                     'Entry_Price': round(entry_price, 3),
                     'Exit_Price': round(exit_price, 3),
+                    'Shares': shares,
                     'Net_Profit': round(net, 2),
                     'Return_%': round(ret_pct, 4),
                     'Exit_Reason': exit_reason,
@@ -1280,6 +1281,13 @@ def render_signal_explorer_tab(df_depth, df_sales):
         f"Filtered by theta gate: {rejected_n}  ·  Accepted but already in a position: {skipped_n}"
     )
 
+    se_pnl_mode = st.radio(
+        "Cumulative P&L Display", ["Mark-to-Market", "Realized Only"],
+        index=0, horizontal=True, key="se_pnl_mode",
+        help="Mark-to-Market values any open position at the current tick's price. "
+             "Realized Only steps only when a trade actually closes."
+    )
+
     # --- Multi-panel figure ---
     fig = make_subplots(
         rows=6, cols=1, shared_xaxes=True, vertical_spacing=0.03,
@@ -1289,7 +1297,7 @@ def render_signal_explorer_tab(df_depth, df_sales):
             "Spatial CVD — Core + Deep Structural Thrust",
             f"Standard CVD ({se_smooth_alg}) — Entries / Rejections",
             "Regime Classifier: OU Decay Rate (θ) & Z-Score",
-            "Cumulative P&L",
+            f"Cumulative P&L — {se_pnl_mode}",
         ),
         row_heights=[0.20, 0.12, 0.14, 0.18, 0.18, 0.18],
         specs=[[{}], [{}], [{}], [{}], [{"secondary_y": True}], [{}]],
@@ -1384,23 +1392,42 @@ def render_signal_explorer_tab(df_depth, df_sales):
     fig.add_hline(y=se_z_thresh, line=dict(color='#bf616a', width=1, dash='dash'),
                   row=5, col=1, secondary_y=True)
 
-    # Row 6: Cumulative P&L (step chart, one step per trade exit)
+    # Row 6: Cumulative P&L — Mark-to-Market (continuous, values open positions each tick)
+    # or Realized Only (step chart, one step per trade exit)
     session_start = sync_df.index[0]
     session_end = sync_df.index[-1]
-    pnl_times = [session_start]
-    pnl_values = [0.0]
-    running = 0.0
-    for tr in trades:
-        running += tr['Net_Profit']
-        pnl_times.append(tr['Exit_Time'])
-        pnl_values.append(running)
-    pnl_times.append(session_end)
-    pnl_values.append(running)
 
-    pnl_fill = 'rgba(163, 190, 140, 0.25)' if running >= 0 else 'rgba(191, 97, 106, 0.2)'
+    if se_pnl_mode == "Mark-to-Market":
+        realized = pd.Series(0.0, index=sync_df.index)
+        floating = pd.Series(0.0, index=sync_df.index)
+        running_realized = 0.0
+        for tr in trades:
+            sign = 1 if tr['Direction'] == 'Long' else -1
+            hold_mask = (sync_df.index >= tr['Entry_Time']) & (sync_df.index <= tr['Exit_Time'])
+            floating.loc[hold_mask] = (sync_df.loc[hold_mask, 'Price'] - tr['Entry_Price']) * tr['Shares'] * sign
+            running_realized += tr['Net_Profit']
+            realized.loc[sync_df.index > tr['Exit_Time']] = running_realized
+        pnl_series = realized + floating
+        pnl_times, pnl_values = pnl_series.index, pnl_series.values
+        line_shape = 'linear'
+        final_value = pnl_values[-1] if len(pnl_values) else 0.0
+    else:
+        pnl_times = [session_start]
+        pnl_values = [0.0]
+        running = 0.0
+        for tr in trades:
+            running += tr['Net_Profit']
+            pnl_times.append(tr['Exit_Time'])
+            pnl_values.append(running)
+        pnl_times.append(session_end)
+        pnl_values.append(running)
+        line_shape = 'hv'
+        final_value = running
+
+    pnl_fill = 'rgba(163, 190, 140, 0.25)' if final_value >= 0 else 'rgba(191, 97, 106, 0.2)'
     fig.add_trace(go.Scatter(
-        x=pnl_times, y=pnl_values, name="Cumulative P&L", mode='lines',
-        line=dict(color='#2e3440', width=1.6, shape='hv'),
+        x=pnl_times, y=pnl_values, name=f"Cumulative P&L ({se_pnl_mode})", mode='lines',
+        line=dict(color='#2e3440', width=1.6, shape=line_shape),
         fill='tozeroy', fillcolor=pnl_fill,
     ), row=6, col=1)
     fig.add_hline(y=0, line=dict(color='gray', width=0.7), row=6, col=1)
