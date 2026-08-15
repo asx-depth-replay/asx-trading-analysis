@@ -751,7 +751,7 @@ def compute_signal_frame(cos_df, md_df, base_span, vel_lb, smooth_win, ou_win,
     """
     Builds the per-tick signal frame: order-book level velocity, CVD, and OU theta/Z-score regime.
     With include_spatial=True, also adds Touch/Core/Deep zone density and the Core+Deep
-    "structural" spatial CVD (Spatial_CVD_BUY/SELL) used by the Signal Explorer.
+    "structural" spatial CVD (Spatial_CVD_BUY/SELL) used by the session drill-down panel.
 
     The total-book pipeline (through Z_Theta/Regime_Change) is numerically identical to the
     original Backtesting-only implementation when called with defaults — existing backtest
@@ -941,13 +941,15 @@ def simulate_session_trades(sync_df, z_thresh, regime, theta_exit, vel_exit, max
 
     return trade_log, current_equity
 
-def run_backtest(session_specs, params, progress_callback=None):
-    """Iterates paired Depth+Sales sessions, compounding equity across sessions in chronological order."""
-    trade_log = []
-    current_equity = params['capital']
-    sessions_run = 0
+def load_backtest_sessions(session_specs, progress_callback=None):
+    """
+    Downloads/reads each paired Depth+Sales session once and preps it to the standard
+    trading session window. This is the slow, network-bound step — kept separate from
+    signal computation so parameter changes never have to re-download anything.
+    Returns {label: (md_df, cos_df)} for sessions that loaded successfully.
+    """
+    loaded = {}
     total = len(session_specs)
-
     for i, spec in enumerate(session_specs):
         if progress_callback:
             progress_callback(i, total, spec['label'])
@@ -972,25 +974,82 @@ def run_backtest(session_specs, params, progress_callback=None):
             if md_df.empty or cos_df.empty:
                 continue
 
+            loaded[spec['label']] = (md_df, cos_df)
+        except Exception as e:
+            st.warning(f"Skipped session {spec['label']}: {e}")
+
+    return loaded
+
+def compute_backtest_run(loaded_sessions, params):
+    """
+    Computes signals + simulates trades for every loaded session, in chronological order,
+    compounding equity across sessions exactly as a continuous paper-trading run would.
+    Pure computation over already-loaded frames — no network calls, safe to re-run reactively
+    on every parameter change.
+
+    Returns a dict with per-session sync frames/trades/events/equity bounds plus the
+    flattened aggregate trades_df used for the tearsheet.
+    """
+    session_order = sorted(loaded_sessions.keys())
+    sync_frames, session_trades, session_events, session_equity = {}, {}, {}, {}
+    trade_log = []
+    current_equity = params['capital']
+    sessions_run = 0
+
+    for label in session_order:
+        md_df, cos_df = loaded_sessions[label]
+        try:
             sync_df = compute_signal_frame(
-                cos_df, md_df,
-                params['base_span'], params['vel_lb'], params['smooth_win'], params['ou_win']
+                cos_df, md_df, params['base_span'], params['vel_lb'], params['smooth_win'], params['ou_win'],
+                smooth_alg=params['smooth_alg'], smooth_thresh=params['smooth_thresh'],
+                include_spatial=True, tick_size=params['tick_size'],
+                touch_ticks=params['touch_ticks'], core_ticks=params['core_ticks'], deep_ticks=params['deep_ticks'],
             )
-            session_trades, current_equity = simulate_session_trades(
+
+            # Session-cumulative VWAP, synced onto the same tick grid as the signals
+            cos_vwap = cos_df.sort_values('datetime').copy()
+            cos_vwap['Cum_Vol'] = cos_vwap['Volume'].cumsum()
+            cos_vwap['Cum_PV'] = (cos_vwap['Price'] * cos_vwap['Volume']).cumsum()
+            cos_vwap['VWAP'] = cos_vwap['Cum_PV'] / cos_vwap['Cum_Vol'].replace(0, 1)
+            sync_df = pd.merge_asof(
+                sync_df.reset_index().sort_values('datetime'),
+                cos_vwap[['datetime', 'VWAP']],
+                on='datetime', direction='backward',
+            ).set_index('datetime')
+            sync_df['VWAP'] = sync_df['VWAP'].ffill()
+
+            start_equity = current_equity
+            trades, current_equity = simulate_session_trades(
                 sync_df, params['z_thresh'], params['regime'],
                 params['theta_exit'], params['vel_exit'],
                 params['max_ticks'], params['hysteresis'],
                 current_equity, params['slippage']
             )
-            for t in session_trades:
-                t['Session'] = spec['label']
-            trade_log.extend(session_trades)
+            events = find_regime_flip_events(sync_df, params['z_thresh'], params['regime'])
+
+            sync_frames[label] = sync_df
+            session_trades[label] = trades
+            session_events[label] = events
+            session_equity[label] = (start_equity, current_equity)
+
+            for t in trades:
+                t_with_session = dict(t)
+                t_with_session['Session'] = label
+                trade_log.append(t_with_session)
             sessions_run += 1
         except Exception as e:
-            st.warning(f"Skipped session {spec['label']}: {e}")
+            st.warning(f"Skipped session {label}: {e}")
 
     trades_df = pd.DataFrame(trade_log) if trade_log else pd.DataFrame()
-    return trades_df, sessions_run
+    return {
+        'session_order': session_order,
+        'sync_frames': sync_frames,
+        'session_trades': session_trades,
+        'session_events': session_events,
+        'session_equity': session_equity,
+        'agg_trades_df': trades_df,
+        'sessions_run': sessions_run,
+    }
 
 def render_backtest_results(trades_df, capital, sessions_run):
     total = len(trades_df)
@@ -1048,220 +1107,16 @@ def render_backtest_results(trades_df, capital, sessions_run):
         file_name="Backtest_Trade_Log.csv", mime="text/csv"
     )
 
-def render_backtesting_tab():
-    st.header("🧪 Signal Backtesting Engine")
-    st.markdown("Replay the CVD-regime / OU-theta strategy across one or more historical sessions.")
-
-    session_specs = []
-
-    with st.expander("📂 Backtest Data Source", expanded=True):
-        bt_source = st.radio("Data Source", ["Google Drive Sessions", "Manual File Upload"], horizontal=True)
-
-        if bt_source == "Google Drive Sessions":
-            depth_files = st.session_state.get('depth_files', {})
-            sales_files = st.session_state.get('sales_files', {})
-            ticker_name = st.session_state.get('bt_ticker_name', 'Unknown')
-
-            if not depth_files or not sales_files:
-                st.warning("Select a Ticker with both Depth and Sales files in the 'Session Database' sidebar panel first.")
-            else:
-                valid_dates = []
-                for fname in depth_files.keys():
-                    m = re.match(r'^(\d{8})', fname)
-                    if m:
-                        date = m.group(1)
-                        if date not in valid_dates and any(f.startswith(date) for f in sales_files.keys()):
-                            valid_dates.append(date)
-                valid_dates = sorted(valid_dates, reverse=True)
-
-                if not valid_dates:
-                    st.warning(f"No paired Depth + Sales sessions found for {ticker_name}.")
-                else:
-                    selected_dates = st.multiselect(
-                        f"Sessions to backtest ({ticker_name}, {len(valid_dates)} available):",
-                        options=valid_dates, default=valid_dates,
-                        format_func=lambda d: f"{d[:4]}-{d[4:6]}-{d[6:]}"
-                    )
-                    # Process chronologically (oldest first) so equity compounds in session order,
-                    # independent of the newest-first display/selection order above.
-                    for date in sorted(selected_dates):
-                        depth_name = next(f for f in depth_files if f.startswith(date))
-                        sales_name = next(f for f in sales_files if f.startswith(date))
-                        session_specs.append({
-                            'label': date, 'source': 'drive',
-                            'depth_id': depth_files[depth_name], 'depth_name': depth_name,
-                            'sales_id': sales_files[sales_name], 'sales_name': sales_name,
-                        })
-        else:
-            bt_depth_uploads = st.file_uploader("Upload Market Depth files", type=["csv", "parquet"], accept_multiple_files=True, key="bt_depth_up")
-            bt_sales_uploads = st.file_uploader("Upload Course of Sales files", type=["csv", "parquet"], accept_multiple_files=True, key="bt_sales_up")
-
-            if bt_depth_uploads and bt_sales_uploads:
-                depth_by_date = {}
-                for f in bt_depth_uploads:
-                    m = re.match(r'^(\d{8})', f.name)
-                    depth_by_date[m.group(1) if m else f.name] = f
-                sales_by_date = {}
-                for f in bt_sales_uploads:
-                    m = re.match(r'^(\d{8})', f.name)
-                    sales_by_date[m.group(1) if m else f.name] = f
-
-                common_dates = sorted(set(depth_by_date) & set(sales_by_date), reverse=True)
-                if not common_dates:
-                    st.warning("Could not match uploaded Depth/Sales files by a common YYYYMMDD date prefix. Rename files accordingly.")
-                else:
-                    selected_dates = st.multiselect("Sessions to backtest:", options=common_dates, default=common_dates)
-                    # Process chronologically (oldest first) so equity compounds in session order.
-                    for date in sorted(selected_dates):
-                        session_specs.append({
-                            'label': date, 'source': 'upload',
-                            'depth_file': depth_by_date[date], 'depth_name': depth_by_date[date].name,
-                            'sales_file': sales_by_date[date], 'sales_name': sales_by_date[date].name,
-                        })
-
-    st.markdown("#### ⚙️ Strategy Parameters")
-    p1, p2 = st.columns(2)
-    with p1:
-        st.markdown("**Signal Parameters**")
-        bt_base_span = st.number_input("Base EMA Span", 1, 200, 15, key="bt_base_span")
-        bt_vel_lb = st.number_input("Vel Lookback", 1, 60, 5, key="bt_vel_lb")
-        bt_smooth_win = st.number_input("Smooth Window", 1, 60, 10, key="bt_smooth_win")
-    with p2:
-        st.markdown("**Regime Filter**")
-        bt_ou_win = st.number_input("OU Window", 10, 720, 120, step=10, key="bt_ou_win")
-        bt_z_thresh = st.number_input("Z Threshold", 0.1, 5.0, 1.0, step=0.1, key="bt_z_thresh")
-        bt_regime = st.selectbox("Trade Regime", ["Trend (Low Theta)", "Fade Trap (High Theta)"], key="bt_regime")
-
-    st.markdown("**Exit Logic**")
-    e1, e2, e3, e4 = st.columns(4)
-    with e1:
-        bt_theta_exit = st.checkbox("Exit on Theta Spike", value=True, key="bt_theta_exit")
-    with e2:
-        bt_vel_exit = st.checkbox("Exit on Vel Cross", value=False, key="bt_vel_exit")
-    with e3:
-        bt_max_ticks = st.number_input("Max Hold Ticks", 1, 500, 40, key="bt_max_ticks")
-    with e4:
-        bt_hysteresis = st.number_input("Hysteresis", 0.0, 2.0, 0.6, step=0.1, key="bt_hysteresis")
-
-    st.markdown("**Portfolio**")
-    po1, po2 = st.columns(2)
-    with po1:
-        bt_capital = st.number_input("Initial Capital ($)", 1000, 10_000_000, 10000, step=1000, key="bt_capital")
-    with po2:
-        bt_slippage = st.number_input("Slippage / Share ($)", 0.0, 0.1, 0.005, step=0.001, format="%.3f", key="bt_slippage")
-
-    st.markdown("---")
-    run_clicked = st.button("▶️ Run Backtest", type="primary", disabled=not session_specs)
-
-    if run_clicked:
-        params = {
-            'base_span': bt_base_span, 'vel_lb': bt_vel_lb, 'smooth_win': bt_smooth_win,
-            'ou_win': bt_ou_win, 'z_thresh': bt_z_thresh, 'regime': bt_regime,
-            'theta_exit': bt_theta_exit, 'vel_exit': bt_vel_exit,
-            'max_ticks': bt_max_ticks, 'hysteresis': bt_hysteresis,
-            'capital': bt_capital, 'slippage': bt_slippage,
-        }
-        progress_bar = st.progress(0, text="Starting backtest...")
-
-        def _progress(i, total, label):
-            progress_bar.progress((i + 1) / total, text=f"Processing {label} ({i + 1}/{total})...")
-
-        with st.spinner("Running backtest..."):
-            trades_df, sessions_run = run_backtest(session_specs, params, progress_callback=_progress)
-        progress_bar.empty()
-
-        st.session_state['bt_trades_df'] = trades_df
-        st.session_state['bt_sessions_run'] = sessions_run
-        st.session_state['bt_capital_used'] = bt_capital
-
-        if trades_df.empty:
-            st.info(f"Done — {sessions_run} session(s) processed, but no trades were generated with these parameters.")
-
-    trades_df = st.session_state.get('bt_trades_df')
-    if trades_df is not None and not trades_df.empty:
-        render_backtest_results(trades_df, st.session_state.get('bt_capital_used', bt_capital), st.session_state.get('bt_sessions_run', 0))
-
-# --- Signal Explorer (Single-Session Signal Replay) ---
-
-def render_signal_explorer_tab(df_depth, df_sales):
-    st.header("🔬 Signal Explorer")
-    st.markdown("Replay this session's signals tick-by-tick and see exactly what triggered each position open/close.")
-
-    st.markdown("#### ⚙️ Strategy Parameters")
-    p1, p2, p3 = st.columns(3)
-    with p1:
-        st.markdown("**Signal Parameters**")
-        se_base_span = st.number_input("Base EMA Span", 1, 200, 15, key="se_base_span")
-        se_vel_lb = st.number_input("Vel Lookback", 1, 60, 5, key="se_vel_lb")
-        se_smooth_alg = st.selectbox("Smoothing Algorithm", ["DEMA", "EMA", "SMA", "Threshold"], key="se_smooth_alg")
-        se_smooth_win = st.number_input("Smoothing Window", 1, 60, 10, key="se_smooth_win")
-        se_thresh = st.number_input("Shock Threshold", 1, 50, 5, key="se_thresh", disabled=(se_smooth_alg != "Threshold"))
-    with p2:
-        st.markdown("**Regime Filter**")
-        se_ou_win = st.number_input("OU Window (ticks)", 10, 720, 120, step=10, key="se_ou_win")
-        se_z_thresh = st.number_input("Z Threshold", 0.1, 5.0, 1.0, step=0.1, key="se_z_thresh")
-        se_regime = st.selectbox("Trade Regime", ["Trend (Low Theta)", "Fade Trap (High Theta)"], key="se_regime")
-    with p3:
-        st.markdown("**Spatial Zones**")
-        se_tick_size = st.number_input("Tick Size ($)", 0.001, 1.0, 0.01, step=0.001, format="%.3f", key="se_tick_size")
-        se_touch_ticks = st.number_input("Touch Zone Max", 1, 20, 5, key="se_touch_ticks")
-        se_core_ticks = st.number_input("Core Zone Max", 5, 60, 15, key="se_core_ticks")
-        se_deep_ticks = st.number_input("Deep Zone Max", 15, 100, 35, key="se_deep_ticks")
-
-    st.markdown("**Exit Logic** (defines the shaded trade windows below)")
-    e1, e2, e3, e4 = st.columns(4)
-    with e1:
-        se_theta_exit = st.checkbox("Exit on Theta Spike", value=True, key="se_theta_exit")
-    with e2:
-        se_vel_exit = st.checkbox("Exit on Vel Cross", value=False, key="se_vel_exit")
-    with e3:
-        se_max_ticks = st.number_input("Max Hold Ticks", 1, 500, 40, key="se_max_ticks")
-    with e4:
-        se_hysteresis = st.number_input("Hysteresis", 0.0, 2.0, 0.6, step=0.1, key="se_hysteresis")
-
-    st.markdown("**Portfolio**")
-    po1, po2 = st.columns(2)
-    with po1:
-        se_capital = st.number_input("Initial Capital ($)", 1000, 10_000_000, 10000, step=1000, key="se_capital")
-    with po2:
-        se_slippage = st.number_input("Slippage / Share ($)", 0.0, 0.1, 0.005, step=0.001, format="%.3f", key="se_slippage")
-
-    md_df = prep_session_frame(df_depth)
-    cos_df = prep_session_frame(df_sales)
-    if md_df is None or md_df.empty or cos_df is None or cos_df.empty:
-        st.warning("No data in the standard 10:00–16:00 session window for this file.")
-        return
-
-    with st.spinner("Computing signals..."):
-        sync_df = compute_signal_frame(
-            cos_df, md_df, se_base_span, se_vel_lb, se_smooth_win, se_ou_win,
-            smooth_alg=se_smooth_alg, smooth_thresh=se_thresh,
-            include_spatial=True, tick_size=se_tick_size,
-            touch_ticks=se_touch_ticks, core_ticks=se_core_ticks, deep_ticks=se_deep_ticks,
-        )
-
-        # Session-cumulative VWAP, synced onto the same tick grid as the signals
-        cos_vwap = cos_df.sort_values('datetime').copy()
-        cos_vwap['Cum_Vol'] = cos_vwap['Volume'].cumsum()
-        cos_vwap['Cum_PV'] = (cos_vwap['Price'] * cos_vwap['Volume']).cumsum()
-        cos_vwap['VWAP'] = cos_vwap['Cum_PV'] / cos_vwap['Cum_Vol'].replace(0, 1)
-        sync_df = pd.merge_asof(
-            sync_df.reset_index().sort_values('datetime'),
-            cos_vwap[['datetime', 'VWAP']],
-            on='datetime', direction='backward',
-        ).set_index('datetime')
-        sync_df['VWAP'] = sync_df['VWAP'].ffill()
-
-        trades, final_equity = simulate_session_trades(
-            sync_df, se_z_thresh, se_regime, se_theta_exit, se_vel_exit,
-            se_max_ticks, se_hysteresis, se_capital, se_slippage
-        )
-        trades_df = pd.DataFrame(trades)
-        events = find_regime_flip_events(sync_df, se_z_thresh, se_regime)
-
+def render_session_signal_panel(sync_df, trades, events, smooth_alg, z_thresh, starting_equity, ending_equity, key_prefix):
+    """
+    Renders the single-session drill-down: mini tearsheet, the 6-panel signal figure with
+    trade/rejection markers, and the trade log. Takes already-computed results (sync_df,
+    trades, events) — no parameter widgets or data loading here, so it's cheap to redraw
+    every time the drill-down focus changes.
+    """
+    trades_df = pd.DataFrame(trades)
     executed_entry_times = set(trades_df['Entry_Time']) if not trades_df.empty else set()
 
-    st.markdown("---")
     total_trades = len(trades_df)
     if total_trades:
         wins = (trades_df['Net_Profit'] > 0).sum()
@@ -1270,7 +1125,7 @@ def render_signal_explorer_tab(df_depth, df_sales):
         c1.metric("Trades", total_trades)
         c2.metric("Win Rate", f"{wins / total_trades * 100:.1f}%")
         c3.metric("Net P/L", f"${net_pnl:+,.2f}")
-        c4.metric("Final Equity", f"${final_equity:,.2f}")
+        c4.metric("Session Equity", f"${starting_equity:,.0f} → ${ending_equity:,.2f}")
     else:
         st.info("No trades were generated for this session with these parameters.")
 
@@ -1281,9 +1136,9 @@ def render_signal_explorer_tab(df_depth, df_sales):
         f"Filtered by theta gate: {rejected_n}  ·  Accepted but already in a position: {skipped_n}"
     )
 
-    se_pnl_mode = st.radio(
+    pnl_mode = st.radio(
         "Cumulative P&L Display", ["Mark-to-Market", "Realized Only"],
-        index=0, horizontal=True, key="se_pnl_mode",
+        index=0, horizontal=True, key=f"{key_prefix}_pnl_mode",
         help="Mark-to-Market values any open position at the current tick's price. "
              "Realized Only steps only when a trade actually closes."
     )
@@ -1295,9 +1150,9 @@ def render_signal_explorer_tab(df_depth, df_sales):
             "Traded Price",
             "Smoothed Level Counts (Total Book)",
             "Spatial CVD — Core + Deep Structural Thrust",
-            f"Standard CVD ({se_smooth_alg}) — Entries / Rejections",
+            f"Standard CVD ({smooth_alg}) — Entries / Rejections",
             "Regime Classifier: OU Decay Rate (θ) & Z-Score",
-            f"Cumulative P&L — {se_pnl_mode}",
+            f"Cumulative P&L — {pnl_mode}",
         ),
         row_heights=[0.20, 0.12, 0.14, 0.18, 0.18, 0.18],
         specs=[[{}], [{}], [{}], [{}], [{"secondary_y": True}], [{}]],
@@ -1389,7 +1244,7 @@ def render_signal_explorer_tab(df_depth, df_sales):
                               fillcolor='rgba(180, 142, 173, 0.2)'), row=5, col=1, secondary_y=False)
     fig.add_trace(go.Scatter(x=sync_df.index, y=sync_df['Z_Theta'], name="Z-θ",
                               line=dict(color='#2e3440', width=1.0, dash='dot')), row=5, col=1, secondary_y=True)
-    fig.add_hline(y=se_z_thresh, line=dict(color='#bf616a', width=1, dash='dash'),
+    fig.add_hline(y=z_thresh, line=dict(color='#bf616a', width=1, dash='dash'),
                   row=5, col=1, secondary_y=True)
 
     # Row 6: Cumulative P&L — Mark-to-Market (continuous, values open positions each tick)
@@ -1397,7 +1252,7 @@ def render_signal_explorer_tab(df_depth, df_sales):
     session_start = sync_df.index[0]
     session_end = sync_df.index[-1]
 
-    if se_pnl_mode == "Mark-to-Market":
+    if pnl_mode == "Mark-to-Market":
         realized = pd.Series(0.0, index=sync_df.index)
         floating = pd.Series(0.0, index=sync_df.index)
         running_realized = 0.0
@@ -1426,7 +1281,7 @@ def render_signal_explorer_tab(df_depth, df_sales):
 
     pnl_fill = 'rgba(163, 190, 140, 0.25)' if final_value >= 0 else 'rgba(191, 97, 106, 0.2)'
     fig.add_trace(go.Scatter(
-        x=pnl_times, y=pnl_values, name=f"Cumulative P&L ({se_pnl_mode})", mode='lines',
+        x=pnl_times, y=pnl_values, name=f"Cumulative P&L ({pnl_mode})", mode='lines',
         line=dict(color='#2e3440', width=1.6, shape=line_shape),
         fill='tozeroy', fillcolor=pnl_fill,
     ), row=6, col=1)
@@ -1442,10 +1297,10 @@ def render_signal_explorer_tab(df_depth, df_sales):
     fig.update_yaxes(title_text="Spatial CVD", row=3, col=1)
     fig.update_yaxes(title_text="CVD", row=4, col=1)
     fig.update_yaxes(title_text="OU θ", row=5, col=1, secondary_y=False)
-    fig.update_yaxes(title_text=f"Z-θ (thresh={se_z_thresh:.1f})", row=5, col=1, secondary_y=True)
+    fig.update_yaxes(title_text=f"Z-θ (thresh={z_thresh:.1f})", row=5, col=1, secondary_y=True)
     fig.update_yaxes(title_text="Cum P&L ($)", row=6, col=1)
 
-    st.plotly_chart(fig, use_container_width=True, theme=None)
+    st.plotly_chart(fig, use_container_width=True, theme=None, key=f"{key_prefix}_fig")
 
     if total_trades:
         st.subheader("📜 Trade Log (this session)")
@@ -1457,8 +1312,212 @@ def render_signal_explorer_tab(df_depth, df_sales):
         csv_bytes = trades_df.to_csv(index=False).encode('utf-8')
         st.download_button(
             "⬇️ Download Trade Log (CSV)", data=csv_bytes,
-            file_name="Signal_Explorer_Trade_Log.csv", mime="text/csv", key="se_csv_dl"
+            file_name="Session_Trade_Log.csv", mime="text/csv", key=f"{key_prefix}_csv_dl"
         )
+
+def render_backtesting_tab():
+    st.header("🧪 Backtesting")
+    st.markdown(
+        "Replay the CVD-regime / OU-theta strategy across one or more historical sessions — "
+        "see the aggregate tearsheet, then step through individual sessions to see exactly "
+        "what triggered each position open/close."
+    )
+
+    session_specs = []
+
+    with st.expander("📂 Backtest Data Source", expanded=True):
+        bt_source = st.radio("Data Source", ["Google Drive Sessions", "Manual File Upload"], horizontal=True)
+
+        if bt_source == "Google Drive Sessions":
+            depth_files = st.session_state.get('depth_files', {})
+            sales_files = st.session_state.get('sales_files', {})
+            ticker_name = st.session_state.get('bt_ticker_name', 'Unknown')
+
+            if not depth_files or not sales_files:
+                st.warning("Select a Ticker with both Depth and Sales files in the 'Session Database' sidebar panel first.")
+            else:
+                valid_dates = []
+                for fname in depth_files.keys():
+                    m = re.match(r'^(\d{8})', fname)
+                    if m:
+                        date = m.group(1)
+                        if date not in valid_dates and any(f.startswith(date) for f in sales_files.keys()):
+                            valid_dates.append(date)
+                valid_dates = sorted(valid_dates, reverse=True)
+
+                if not valid_dates:
+                    st.warning(f"No paired Depth + Sales sessions found for {ticker_name}.")
+                else:
+                    selected_dates = st.multiselect(
+                        f"Sessions to backtest ({ticker_name}, {len(valid_dates)} available):",
+                        options=valid_dates, default=valid_dates,
+                        format_func=lambda d: f"{d[:4]}-{d[4:6]}-{d[6:]}"
+                    )
+                    for date in selected_dates:
+                        depth_name = next(f for f in depth_files if f.startswith(date))
+                        sales_name = next(f for f in sales_files if f.startswith(date))
+                        session_specs.append({
+                            'label': date, 'source': 'drive',
+                            'depth_id': depth_files[depth_name], 'depth_name': depth_name,
+                            'sales_id': sales_files[sales_name], 'sales_name': sales_name,
+                        })
+        else:
+            bt_depth_uploads = st.file_uploader("Upload Market Depth files", type=["csv", "parquet"], accept_multiple_files=True, key="bt_depth_up")
+            bt_sales_uploads = st.file_uploader("Upload Course of Sales files", type=["csv", "parquet"], accept_multiple_files=True, key="bt_sales_up")
+
+            if bt_depth_uploads and bt_sales_uploads:
+                depth_by_date = {}
+                for f in bt_depth_uploads:
+                    m = re.match(r'^(\d{8})', f.name)
+                    depth_by_date[m.group(1) if m else f.name] = f
+                sales_by_date = {}
+                for f in bt_sales_uploads:
+                    m = re.match(r'^(\d{8})', f.name)
+                    sales_by_date[m.group(1) if m else f.name] = f
+
+                common_dates = sorted(set(depth_by_date) & set(sales_by_date), reverse=True)
+                if not common_dates:
+                    st.warning("Could not match uploaded Depth/Sales files by a common YYYYMMDD date prefix. Rename files accordingly.")
+                else:
+                    selected_dates = st.multiselect("Sessions to backtest:", options=common_dates, default=common_dates)
+                    for date in selected_dates:
+                        session_specs.append({
+                            'label': date, 'source': 'upload',
+                            'depth_file': depth_by_date[date], 'depth_name': depth_by_date[date].name,
+                            'sales_file': sales_by_date[date], 'sales_name': sales_by_date[date].name,
+                        })
+
+    st.markdown("#### ⚙️ Strategy Parameters")
+    p1, p2, p3 = st.columns(3)
+    with p1:
+        st.markdown("**Signal Parameters**")
+        bt_base_span = st.number_input("Base EMA Span", 1, 200, 15, key="bt_base_span")
+        bt_vel_lb = st.number_input("Vel Lookback", 1, 60, 5, key="bt_vel_lb")
+        bt_smooth_alg = st.selectbox("Smoothing Algorithm", ["DEMA", "EMA", "SMA", "Threshold"], key="bt_smooth_alg")
+        bt_smooth_win = st.number_input("Smoothing Window", 1, 60, 10, key="bt_smooth_win")
+        bt_thresh = st.number_input("Shock Threshold", 1, 50, 5, key="bt_thresh", disabled=(bt_smooth_alg != "Threshold"))
+    with p2:
+        st.markdown("**Regime Filter**")
+        bt_ou_win = st.number_input("OU Window (ticks)", 10, 720, 120, step=10, key="bt_ou_win")
+        bt_z_thresh = st.number_input("Z Threshold", 0.1, 5.0, 1.0, step=0.1, key="bt_z_thresh")
+        bt_regime = st.selectbox("Trade Regime", ["Trend (Low Theta)", "Fade Trap (High Theta)"], key="bt_regime")
+    with p3:
+        st.markdown("**Spatial Zones**")
+        bt_tick_size = st.number_input("Tick Size ($)", 0.001, 1.0, 0.01, step=0.001, format="%.3f", key="bt_tick_size")
+        bt_touch_ticks = st.number_input("Touch Zone Max", 1, 20, 5, key="bt_touch_ticks")
+        bt_core_ticks = st.number_input("Core Zone Max", 5, 60, 15, key="bt_core_ticks")
+        bt_deep_ticks = st.number_input("Deep Zone Max", 15, 100, 35, key="bt_deep_ticks")
+
+    st.markdown("**Exit Logic**")
+    e1, e2, e3, e4 = st.columns(4)
+    with e1:
+        bt_theta_exit = st.checkbox("Exit on Theta Spike", value=True, key="bt_theta_exit")
+    with e2:
+        bt_vel_exit = st.checkbox("Exit on Vel Cross", value=False, key="bt_vel_exit")
+    with e3:
+        bt_max_ticks = st.number_input("Max Hold Ticks", 1, 500, 40, key="bt_max_ticks")
+    with e4:
+        bt_hysteresis = st.number_input("Hysteresis", 0.0, 2.0, 0.6, step=0.1, key="bt_hysteresis")
+
+    st.markdown("**Portfolio**")
+    po1, po2 = st.columns(2)
+    with po1:
+        bt_capital = st.number_input("Initial Capital ($)", 1000, 10_000_000, 10000, step=1000, key="bt_capital")
+    with po2:
+        bt_slippage = st.number_input("Slippage / Share ($)", 0.0, 0.1, 0.005, step=0.001, format="%.3f", key="bt_slippage")
+
+    st.markdown("---")
+    load_clicked = st.button("📥 Load Sessions", type="primary", disabled=not session_specs,
+                              help="Downloads/reads the selected sessions once. Strategy parameter changes "
+                                   "below then recompute instantly without reloading anything.")
+
+    if load_clicked:
+        progress_bar = st.progress(0, text="Loading sessions...")
+
+        def _progress(i, total, label):
+            progress_bar.progress((i + 1) / total, text=f"Loading {label} ({i + 1}/{total})...")
+
+        with st.spinner("Loading sessions..."):
+            loaded = load_backtest_sessions(session_specs, progress_callback=_progress)
+        progress_bar.empty()
+
+        st.session_state['bt_loaded_sessions'] = loaded
+        st.session_state['bt_params_key'] = None  # force a recompute below
+
+        if not loaded:
+            st.warning("No sessions could be loaded.")
+        else:
+            st.success(f"Loaded {len(loaded)} session(s). Adjust parameters below — no reload needed.")
+
+    loaded_sessions = st.session_state.get('bt_loaded_sessions', {})
+
+    if loaded_sessions:
+        params = {
+            'base_span': bt_base_span, 'vel_lb': bt_vel_lb, 'smooth_win': bt_smooth_win,
+            'smooth_alg': bt_smooth_alg, 'smooth_thresh': bt_thresh,
+            'ou_win': bt_ou_win, 'z_thresh': bt_z_thresh, 'regime': bt_regime,
+            'tick_size': bt_tick_size, 'touch_ticks': bt_touch_ticks,
+            'core_ticks': bt_core_ticks, 'deep_ticks': bt_deep_ticks,
+            'theta_exit': bt_theta_exit, 'vel_exit': bt_vel_exit,
+            'max_ticks': bt_max_ticks, 'hysteresis': bt_hysteresis,
+            'capital': bt_capital, 'slippage': bt_slippage,
+        }
+        params_key = (tuple(sorted(params.items())), tuple(sorted(loaded_sessions.keys())))
+
+        if st.session_state.get('bt_params_key') != params_key:
+            with st.spinner("Computing signals across loaded sessions..."):
+                result = compute_backtest_run(loaded_sessions, params)
+            st.session_state['bt_run_result'] = result
+            st.session_state['bt_capital_used'] = bt_capital
+            st.session_state['bt_params_key'] = params_key
+
+        result = st.session_state.get('bt_run_result')
+
+        if result and not result['agg_trades_df'].empty:
+            render_backtest_results(result['agg_trades_df'], st.session_state.get('bt_capital_used', bt_capital), result['sessions_run'])
+        elif result:
+            st.info(f"Done — {result['sessions_run']} session(s) processed, but no trades were generated with these parameters.")
+
+        session_order = result['session_order'] if result else []
+        if session_order:
+            st.markdown("---")
+            st.markdown("### 🔬 Session Drill-Down")
+
+            if st.session_state.get('bt_focus_label') not in session_order:
+                st.session_state['bt_focus_label'] = session_order[0]
+
+            def _move_focus(direction):
+                labels = st.session_state['bt_session_order']
+                cur = st.session_state['bt_focus_label']
+                idx = labels.index(cur)
+                if direction == 'next' and idx < len(labels) - 1:
+                    st.session_state['bt_focus_label'] = labels[idx + 1]
+                elif direction == 'prev' and idx > 0:
+                    st.session_state['bt_focus_label'] = labels[idx - 1]
+
+            st.session_state['bt_session_order'] = session_order
+
+            col_prev, col_label, col_next = st.columns([1, 4, 1])
+            with col_prev:
+                st.button("⬅️ Prev", on_click=_move_focus, args=("prev",), use_container_width=True)
+            with col_next:
+                st.button("Next ➡️", on_click=_move_focus, args=("next",), use_container_width=True)
+            with col_label:
+                st.selectbox(
+                    "Session", options=session_order,
+                    format_func=lambda d: f"{d[:4]}-{d[4:6]}-{d[6:]}  ({session_order.index(d) + 1} of {len(session_order)})",
+                    key="bt_focus_label", label_visibility="collapsed",
+                )
+
+            focus_label = st.session_state['bt_focus_label']
+            start_eq, end_eq = result['session_equity'][focus_label]
+            render_session_signal_panel(
+                result['sync_frames'][focus_label], result['session_trades'][focus_label],
+                result['session_events'][focus_label], bt_smooth_alg, bt_z_thresh,
+                start_eq, end_eq, key_prefix="bt_drill",
+            )
+    else:
+        st.info("Select sessions above and click **Load Sessions** to begin.")
 
 # --- Streamlit App UI ---
 st.title("📈 Interactive Trade Session Analysis Tool")
@@ -1559,7 +1618,7 @@ if df_depth is not None and not df_depth.empty:
 st.sidebar.subheader("Analysis Options")
 analysis_type = st.sidebar.selectbox(
     "Select Analysis Type",
-    ["Hourly Volume Analysis", "Volume Profile", "Hourly Volume Distribution", "Market Depth Explorer", "Backtesting", "Signal Explorer"]
+    ["Hourly Volume Analysis", "Volume Profile", "Hourly Volume Distribution", "Market Depth Explorer", "Backtesting"]
 )
 
 # Global Price Bin Size (Consolidated)
@@ -1721,12 +1780,6 @@ if analysis_type == "Market Depth Explorer":
 
 elif analysis_type == "Backtesting":
     render_backtesting_tab()
-
-elif analysis_type == "Signal Explorer":
-    if df_depth is not None and not df_depth.empty and df_sales is not None and not df_sales.empty:
-        render_signal_explorer_tab(df_depth, df_sales)
-    else:
-        st.warning("Please upload BOTH a Market Depth CSV and Course of Sales CSV to unlock the Signal Explorer.")
 
 elif df_sales is not None:
     st.sidebar.subheader("⏳ Time Filter (Sales Data)")
