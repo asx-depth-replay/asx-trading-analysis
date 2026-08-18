@@ -1136,6 +1136,22 @@ def render_session_signal_panel(sync_df, trades, events, smooth_alg, z_thresh, s
         f"Filtered by theta gate: {rejected_n}  ·  Accepted but already in a position: {skipped_n}"
     )
 
+    with st.expander("ℹ️ What do the exit reasons mean?", expanded=False):
+        st.markdown(
+            """
+- **Theta Spike** — the regime classifier detected the book snapping back unusually fast mid-trade
+  (θ's Z-score crossed the threshold). Read as: the move likely wasn't genuine institutional weight —
+  get out before it reverses.
+- **Momentum Exhaustion** — the opposing side's velocity re-accelerated past the entry side's. Read as:
+  the thesis is invalidated, the other side is fighting back harder than you are.
+- **Max Time (N ticks)** — the position hit its hard time-stop without triggering either exit above.
+  Read as: momentum never confirmed and never fully broke down either — a "sat there" trade.
+
+A healthy run should be dominated by Momentum Exhaustion exits (the strategy working as intended) with
+Theta Spike catching the occasional trap.
+            """
+        )
+
     pnl_mode = st.radio(
         "Cumulative P&L Display", ["Mark-to-Market", "Realized Only"],
         index=0, horizontal=True, key=f"{key_prefix}_pnl_mode",
@@ -1323,6 +1339,42 @@ def render_backtesting_tab():
         "what triggered each position open/close."
     )
 
+    with st.expander("📖 How this strategy works (plain-language guide)", expanded=False):
+        st.markdown(
+            """
+**The core idea:** instead of watching order *size* (easy to fake with a single large iceberg order),
+this strategy watches the **number of distinct price levels** populated on each side of the book —
+"level count." Populating 50 separate price levels takes 50 separate orders, which is expensive and
+slow to fake. A spoofed book usually can't sustain high level counts the way genuine institutional
+interest can.
+
+**The signal chain, step by step:**
+1. **Level Counts** — how many distinct BUY / SELL price levels exist right now, smoothed with an EMA
+   so a single flickering order doesn't move the signal.
+2. **Velocity** — the *rate of change* of those smoothed counts. A spike means one side of the book is
+   expanding rapidly.
+3. **CVD (Cumulative Thrust)** — velocity added up over time. When BUY's cumulative thrust overtakes
+   SELL's (or vice versa), that's a **regime flip** — a candidate entry signal.
+4. **OU Theta / Z-Score (the regime classifier)** — not every flip is worth trading. This measures how
+   fast the book "snaps back" to normal after a move (θ, the decay rate), then asks whether the *current*
+   decay rate is unusually fast or slow compared to the recent session (its Z-score).
+   - **Low θ (slow decay)** → the imbalance is sticky → genuine institutional weight → **trending regime**.
+   - **High θ (fast decay)** → the imbalance snaps back instantly → likely spoofing / toxic liquidity →
+     **mean-reverting regime**.
+   - **Trend (Low Theta)** mode trades *with* a flip only when θ is calm. **Fade Trap (High Theta)** mode
+     trades *against* a flip when θ is spiking, on the theory that the flip itself was a trap.
+5. **Exit logic** — a position closes the instant the regime turns toxic (Theta Spike), momentum reverses
+   (Vel Cross), or a hard time limit is hit (Max Hold Ticks) — whichever comes first.
+
+**Spatial Zones** add a second, independent version of the same idea: orders sitting right at the
+best price ("Touch") are the cheapest to fake, so the **Spatial CVD** panel only counts levels further
+out ("Core"/"Deep") as structural — a second lens on the same "harder to fake" principle.
+
+Every parameter below has a hover tooltip (ⓘ) explaining what it does — hover over any label for a
+one-line explanation.
+            """
+        )
+
     session_specs = []
 
     with st.expander("📂 Backtest Data Source", expanded=True):
@@ -1391,40 +1443,111 @@ def render_backtesting_tab():
     p1, p2, p3 = st.columns(3)
     with p1:
         st.markdown("**Signal Parameters**")
-        bt_base_span = st.number_input("Base EMA Span", 1, 200, 15, key="bt_base_span")
-        bt_vel_lb = st.number_input("Vel Lookback", 1, 60, 5, key="bt_vel_lb")
-        bt_smooth_alg = st.selectbox("Smoothing Algorithm", ["DEMA", "EMA", "SMA", "Threshold"], key="bt_smooth_alg")
-        bt_smooth_win = st.number_input("Smoothing Window", 1, 60, 10, key="bt_smooth_win")
-        bt_thresh = st.number_input("Shock Threshold", 1, 50, 5, key="bt_thresh", disabled=(bt_smooth_alg != "Threshold"))
+        bt_base_span = st.number_input(
+            "Base EMA Span", 1, 200, 15, key="bt_base_span",
+            help="How many ticks of history smooth the raw BUY/SELL level counts before anything "
+                 "else is calculated. Lower = more reactive, noisier."
+        )
+        bt_vel_lb = st.number_input(
+            "Vel Lookback", 1, 60, 5, key="bt_vel_lb",
+            help="How many ticks back velocity is measured over — the rate of change of the "
+                 "smoothed level counts."
+        )
+        bt_smooth_alg = st.selectbox(
+            "Smoothing Algorithm", ["DEMA", "EMA", "SMA", "Threshold"], key="bt_smooth_alg",
+            help="How the velocity signal is de-noised before it feeds CVD. DEMA reacts fast with "
+                 "little lag; SMA is the strongest filter but laggiest; Threshold ignores small "
+                 "moves entirely (a noise gate)."
+        )
+        bt_smooth_win = st.number_input(
+            "Smoothing Window", 1, 60, 10, key="bt_smooth_win",
+            help="Window size used by the smoothing algorithm above."
+        )
+        bt_thresh = st.number_input(
+            "Shock Threshold", 1, 50, 5, key="bt_thresh", disabled=(bt_smooth_alg != "Threshold"),
+            help="Only used by the Threshold algorithm — velocity readings below this are treated "
+                 "as zero (noise gate)."
+        )
     with p2:
         st.markdown("**Regime Filter**")
-        bt_ou_win = st.number_input("OU Window (ticks)", 10, 720, 120, step=10, key="bt_ou_win")
-        bt_z_thresh = st.number_input("Z Threshold", 0.1, 5.0, 1.0, step=0.1, key="bt_z_thresh")
-        bt_regime = st.selectbox("Trade Regime", ["Trend (Low Theta)", "Fade Trap (High Theta)"], key="bt_regime")
+        bt_ou_win = st.number_input(
+            "OU Window (ticks)", 10, 720, 120, step=10, key="bt_ou_win",
+            help="How many ticks the regime classifier looks back to measure whether the book is "
+                 "trending or snapping back (θ, the decay rate). Research found 120 ticks (~10 min) "
+                 "to be the sweet spot."
+        )
+        bt_z_thresh = st.number_input(
+            "Z Threshold", 0.1, 5.0, 1.0, step=0.1, key="bt_z_thresh",
+            help="How unusual the current decay rate (θ) must be, in standard deviations, before a "
+                 "regime flip counts as genuine rather than noise."
+        )
+        bt_regime = st.selectbox(
+            "Trade Regime", ["Trend (Low Theta)", "Fade Trap (High Theta)"], key="bt_regime",
+            help="Trend (Low Theta) trades WITH a level-count regime flip when decay is slow "
+                 "(sticky, institutional liquidity). Fade Trap (High Theta) trades AGAINST the flip "
+                 "when decay is fast (likely spoofing / toxic liquidity)."
+        )
     with p3:
         st.markdown("**Spatial Zones**")
-        bt_tick_size = st.number_input("Tick Size ($)", 0.001, 1.0, 0.01, step=0.001, format="%.3f", key="bt_tick_size")
-        bt_touch_ticks = st.number_input("Touch Zone Max", 1, 20, 5, key="bt_touch_ticks")
-        bt_core_ticks = st.number_input("Core Zone Max", 5, 60, 15, key="bt_core_ticks")
-        bt_deep_ticks = st.number_input("Deep Zone Max", 15, 100, 35, key="bt_deep_ticks")
+        bt_tick_size = st.number_input(
+            "Tick Size ($)", 0.001, 1.0, 0.01, step=0.001, format="%.3f", key="bt_tick_size",
+            help="Price increment used to bucket resting orders into Touch/Core/Deep "
+                 "distance-from-mid zones."
+        )
+        bt_touch_ticks = st.number_input(
+            "Touch Zone Max", 1, 20, 5, key="bt_touch_ticks",
+            help="Orders within this many ticks of the mid-price are 'Touch' — cheapest to fake, "
+                 "most likely to be spoofing. Excluded from the Spatial CVD structural signal."
+        )
+        bt_core_ticks = st.number_input(
+            "Core Zone Max", 5, 60, 15, key="bt_core_ticks",
+            help="Orders beyond Touch but within this many ticks are 'Core' — counted in the "
+                 "Spatial CVD structural signal."
+        )
+        bt_deep_ticks = st.number_input(
+            "Deep Zone Max", 15, 100, 35, key="bt_deep_ticks",
+            help="Orders beyond Core but within this many ticks are 'Deep' — also counted in the "
+                 "structural signal. Anything further out is ignored entirely."
+        )
 
     st.markdown("**Exit Logic**")
     e1, e2, e3, e4 = st.columns(4)
     with e1:
-        bt_theta_exit = st.checkbox("Exit on Theta Spike", value=True, key="bt_theta_exit")
+        bt_theta_exit = st.checkbox(
+            "Exit on Theta Spike", value=True, key="bt_theta_exit",
+            help="Close the position the instant the regime classifier detects toxic/spoofing "
+                 "conditions mid-trade."
+        )
     with e2:
-        bt_vel_exit = st.checkbox("Exit on Vel Cross", value=False, key="bt_vel_exit")
+        bt_vel_exit = st.checkbox(
+            "Exit on Vel Cross", value=False, key="bt_vel_exit",
+            help="Close the position when the opposing side's velocity re-accelerates past the "
+                 "entry side's, signalling momentum has flipped."
+        )
     with e3:
-        bt_max_ticks = st.number_input("Max Hold Ticks", 1, 500, 40, key="bt_max_ticks")
+        bt_max_ticks = st.number_input(
+            "Max Hold Ticks", 1, 500, 40, key="bt_max_ticks",
+            help="Hard time-stop — force-close any position still open after this many ticks."
+        )
     with e4:
-        bt_hysteresis = st.number_input("Hysteresis", 0.0, 2.0, 0.6, step=0.1, key="bt_hysteresis")
+        bt_hysteresis = st.number_input(
+            "Hysteresis", 0.0, 2.0, 0.6, step=0.1, key="bt_hysteresis",
+            help="Padding added to the momentum-exit trigger so ordinary tick-to-tick noise doesn't "
+                 "fake you out of a winning trade."
+        )
 
     st.markdown("**Portfolio**")
     po1, po2 = st.columns(2)
     with po1:
-        bt_capital = st.number_input("Initial Capital ($)", 1000, 10_000_000, 10000, step=1000, key="bt_capital")
+        bt_capital = st.number_input(
+            "Initial Capital ($)", 1000, 10_000_000, 10000, step=1000, key="bt_capital",
+            help="Starting account size used to size every position (100% of current equity per trade)."
+        )
     with po2:
-        bt_slippage = st.number_input("Slippage / Share ($)", 0.0, 0.1, 0.005, step=0.001, format="%.3f", key="bt_slippage")
+        bt_slippage = st.number_input(
+            "Slippage / Share ($)", 0.0, 0.1, 0.005, step=0.001, format="%.3f", key="bt_slippage",
+            help="Estimated cost per share paid on both entry and exit, deducted from every trade's P&L."
+        )
 
     st.markdown("---")
     load_clicked = st.button("📥 Load Sessions", type="primary", disabled=not session_specs,
