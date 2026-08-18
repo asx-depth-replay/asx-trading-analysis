@@ -981,24 +981,36 @@ def load_backtest_sessions(session_specs, progress_callback=None):
             if md_df.empty or cos_df.empty:
                 continue
 
+            # Keep only the columns the backtest engine actually reads. The raw depth/sales
+            # frames carry several columns (Number_of_Orders, Ticker, Condition, Market, ...)
+            # that were only needed during parsing -- dropping them here meaningfully cuts
+            # memory when several sessions are loaded and held for reactive recompute.
+            md_df = md_df[['datetime', 'Type', 'Price']].reset_index(drop=True)
+            cos_df = cos_df[['datetime', 'Price', 'Volume']].reset_index(drop=True)
+
             loaded[spec['label']] = (md_df, cos_df)
         except Exception as e:
             st.warning(f"Skipped session {spec['label']}: {e}")
 
     return loaded
 
-def compute_backtest_run(loaded_sessions, params):
+def compute_light_backtest(loaded_sessions, params):
     """
-    Computes signals + simulates trades for every loaded session, in chronological order,
-    compounding equity across sessions exactly as a continuous paper-trading run would.
+    Computes trades for every loaded session, in chronological order, compounding equity
+    across sessions exactly as a continuous paper-trading run would.
+
+    Deliberately uses only the *light* signal frame (include_spatial=False, no VWAP merge) --
+    simulate_session_trades() and find_regime_flip_events() only ever read Regime_Change,
+    Z_Theta, Price, BUY_Vel and SELL_Vel, none of which need the spatial/VWAP columns. That
+    frame is discarded immediately after use, so memory stays flat no matter how many
+    sessions are loaded. The wider frame the drill-down chart needs is built separately, for
+    one session at a time, by compute_focus_display_frame().
+
     Pure computation over already-loaded frames — no network calls, safe to re-run reactively
     on every parameter change.
-
-    Returns a dict with per-session sync frames/trades/events/equity bounds plus the
-    flattened aggregate trades_df used for the tearsheet.
     """
     session_order = sorted(loaded_sessions.keys())
-    sync_frames, session_trades, session_events, session_equity = {}, {}, {}, {}
+    session_trades, session_events, session_equity = {}, {}, {}
     trade_log = []
     current_equity = params['capital']
     sessions_run = 0
@@ -1009,21 +1021,7 @@ def compute_backtest_run(loaded_sessions, params):
             sync_df = compute_signal_frame(
                 cos_df, md_df, params['base_span'], params['vel_lb'], params['smooth_win'], params['ou_win'],
                 smooth_alg=params['smooth_alg'], smooth_thresh=params['smooth_thresh'],
-                include_spatial=True, tick_size=params['tick_size'],
-                touch_ticks=params['touch_ticks'], core_ticks=params['core_ticks'], deep_ticks=params['deep_ticks'],
             )
-
-            # Session-cumulative VWAP, synced onto the same tick grid as the signals
-            cos_vwap = cos_df.sort_values('datetime').copy()
-            cos_vwap['Cum_Vol'] = cos_vwap['Volume'].cumsum()
-            cos_vwap['Cum_PV'] = (cos_vwap['Price'] * cos_vwap['Volume']).cumsum()
-            cos_vwap['VWAP'] = cos_vwap['Cum_PV'] / cos_vwap['Cum_Vol'].replace(0, 1)
-            sync_df = pd.merge_asof(
-                sync_df.reset_index().sort_values('datetime'),
-                cos_vwap[['datetime', 'VWAP']],
-                on='datetime', direction='backward',
-            ).set_index('datetime')
-            sync_df['VWAP'] = sync_df['VWAP'].ffill()
 
             start_equity = current_equity
             trades, current_equity = simulate_session_trades(
@@ -1034,7 +1032,6 @@ def compute_backtest_run(loaded_sessions, params):
             )
             events = find_regime_flip_events(sync_df, params['z_thresh'], params['regime'])
 
-            sync_frames[label] = sync_df
             session_trades[label] = trades
             session_events[label] = events
             session_equity[label] = (start_equity, current_equity)
@@ -1050,13 +1047,41 @@ def compute_backtest_run(loaded_sessions, params):
     trades_df = pd.DataFrame(trade_log) if trade_log else pd.DataFrame()
     return {
         'session_order': session_order,
-        'sync_frames': sync_frames,
         'session_trades': session_trades,
         'session_events': session_events,
         'session_equity': session_equity,
         'agg_trades_df': trades_df,
         'sessions_run': sessions_run,
     }
+
+def compute_focus_display_frame(loaded_sessions, params, focus_label):
+    """
+    Builds the single spatial-enriched, VWAP-synced signal frame the session drill-down chart
+    needs, for exactly one session. Kept separate from compute_light_backtest() so the app
+    never has to hold more than one of these wide per-tick frames in memory at a time, however
+    many sessions are loaded.
+    """
+    md_df, cos_df = loaded_sessions[focus_label]
+    sync_df = compute_signal_frame(
+        cos_df, md_df, params['base_span'], params['vel_lb'], params['smooth_win'], params['ou_win'],
+        smooth_alg=params['smooth_alg'], smooth_thresh=params['smooth_thresh'],
+        include_spatial=True, tick_size=params['tick_size'],
+        touch_ticks=params['touch_ticks'], core_ticks=params['core_ticks'], deep_ticks=params['deep_ticks'],
+    )
+
+    # Session-cumulative VWAP, synced onto the same tick grid as the signals
+    cos_vwap = cos_df.sort_values('datetime').copy()
+    cos_vwap['Cum_Vol'] = cos_vwap['Volume'].cumsum()
+    cos_vwap['Cum_PV'] = (cos_vwap['Price'] * cos_vwap['Volume']).cumsum()
+    cos_vwap['VWAP'] = cos_vwap['Cum_PV'] / cos_vwap['Cum_Vol'].replace(0, 1)
+    sync_df = pd.merge_asof(
+        sync_df.reset_index().sort_values('datetime'),
+        cos_vwap[['datetime', 'VWAP']],
+        on='datetime', direction='backward',
+    ).set_index('datetime')
+    sync_df['VWAP'] = sync_df['VWAP'].ffill()
+
+    return sync_df
 
 def render_backtest_results(trades_df, capital, sessions_run):
     total = len(trades_df)
@@ -1595,12 +1620,15 @@ one-line explanation.
         }
         params_key = (tuple(sorted(params.items())), tuple(sorted(loaded_sessions.keys())))
 
+        # Tier 1: trades/tearsheet for every loaded session. Cheap (no spatial/VWAP columns),
+        # so it's fine to hold in memory regardless of how many sessions are loaded.
         if st.session_state.get('bt_params_key') != params_key:
             with st.spinner("Computing signals across loaded sessions..."):
-                result = compute_backtest_run(loaded_sessions, params)
+                result = compute_light_backtest(loaded_sessions, params)
             st.session_state['bt_run_result'] = result
             st.session_state['bt_capital_used'] = bt_capital
             st.session_state['bt_params_key'] = params_key
+            st.session_state['bt_focus_key'] = None  # force the focus frame to rebuild below
 
         result = st.session_state.get('bt_run_result')
 
@@ -1641,9 +1669,20 @@ one-line explanation.
                 )
 
             focus_label = st.session_state['bt_focus_label']
+
+            # Tier 2: the one wide spatial/VWAP frame the chart needs, for the focused session
+            # only. Recomputed when params change OR when the focus moves to a different
+            # session -- but never holds more than one of these frames in memory at a time,
+            # regardless of how many sessions are loaded.
+            focus_key = (params_key, focus_label)
+            if st.session_state.get('bt_focus_key') != focus_key:
+                with st.spinner(f"Preparing {focus_label} for drill-down..."):
+                    st.session_state['bt_focus_sync_df'] = compute_focus_display_frame(loaded_sessions, params, focus_label)
+                st.session_state['bt_focus_key'] = focus_key
+
             start_eq, end_eq = result['session_equity'][focus_label]
             render_session_signal_panel(
-                result['sync_frames'][focus_label], result['session_trades'][focus_label],
+                st.session_state['bt_focus_sync_df'], result['session_trades'][focus_label],
                 result['session_events'][focus_label], bt_smooth_alg, bt_z_thresh,
                 start_eq, end_eq, key_prefix="bt_drill",
             )
