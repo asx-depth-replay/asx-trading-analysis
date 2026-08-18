@@ -18,19 +18,37 @@ def get_gdrive_service():
     creds = service_account.Credentials.from_service_account_info(st.secrets["gdrive_service_account"])
     return build('drive', 'v3', credentials=creds)
 
+def _list_all_drive_files(query):
+    """
+    Runs a Drive files().list() query across ALL result pages. The Drive API caps a single
+    call at 100 files by default and returns them in no guaranteed order (not sorted by name
+    or date) -- without following nextPageToken, a folder with more files than one page would
+    silently lose an arbitrary subset, which looks like "the session list stops at some date"
+    even though older sessions still exist.
+    """
+    service = get_gdrive_service()
+    files = []
+    page_token = None
+    while True:
+        results = service.files().list(
+            q=query, fields="nextPageToken, files(id, name)",
+            pageSize=1000, pageToken=page_token,
+        ).execute()
+        files.extend(results.get('files', []))
+        page_token = results.get('nextPageToken')
+        if not page_token:
+            break
+    return files
+
 def list_drive_folders(parent_id):
     """Lists subfolders (Tickers) in the root folder."""
-    service = get_gdrive_service()
     query = f"'{parent_id}' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
-    results = service.files().list(q=query, fields="files(id, name)").execute()
-    return {f['name']: f['id'] for f in results.get('files', [])}
+    return {f['name']: f['id'] for f in _list_all_drive_files(query)}
 
 def list_files_in_folder(folder_id):
     """Lists all parquet/csv files in a specific ticker's folder."""
-    service = get_gdrive_service()
     query = f"'{folder_id}' in parents and (name contains '.parquet' or name contains '.csv') and trashed = false"
-    results = service.files().list(q=query, fields="files(id, name)").execute()
-    return {f['name']: f['id'] for f in results.get('files', [])}
+    return {f['name']: f['id'] for f in _list_all_drive_files(query)}
 
 def download_from_gdrive(file_id):
     """Downloads file from Drive into memory."""
