@@ -869,8 +869,12 @@ def find_regime_flip_events(sync_df, z_thresh, regime):
 
     return events
 
-def simulate_session_trades(sync_df, z_thresh, regime, theta_exit, vel_exit, max_ticks, hysteresis_mult, starting_equity, slippage):
-    """Runs the CVD-regime-change entry / theta-spike-or-momentum exit loop for a single session."""
+def simulate_session_trades(sync_df, z_thresh, regime, theta_exit, vel_exit, max_ticks, hysteresis_mult, starting_equity, commission_pct):
+    """
+    Runs the CVD-regime-change entry / theta-spike-or-momentum exit loop for a single session.
+    commission_pct is the broker commission per side, in percent (e.g. 0.05 = 0.05%, so 0.10%
+    round trip) — charged on both the entry and exit notional.
+    """
     trade_log = []
     current_equity = starting_equity
     n = len(sync_df)
@@ -919,9 +923,10 @@ def simulate_session_trades(sync_df, z_thresh, regime, theta_exit, vel_exit, max
                 exit_time = sync_df.index[exit_idx]
                 shares = current_equity / entry_price
                 gross = ((exit_price - entry_price) if direction == 'Long' else (entry_price - exit_price)) * shares
-                net = gross - (shares * slippage * 2)
+                commission = (shares * entry_price + shares * exit_price) * (commission_pct / 100.0)
+                net = gross - commission
                 current_equity += net
-                ret_pct = (net / current_equity) * 100
+                net_ret_pct = (net / current_equity) * 100
 
                 trade_log.append({
                     'Entry_Time': entry_time,
@@ -931,8 +936,10 @@ def simulate_session_trades(sync_df, z_thresh, regime, theta_exit, vel_exit, max
                     'Entry_Price': round(entry_price, 3),
                     'Exit_Price': round(exit_price, 3),
                     'Shares': shares,
+                    'Gross_Profit': round(gross, 2),
+                    'Commission': round(commission, 2),
                     'Net_Profit': round(net, 2),
-                    'Return_%': round(ret_pct, 4),
+                    'Net_Return_%': round(net_ret_pct, 4),
                     'Exit_Reason': exit_reason,
                     'Equity_After': round(current_equity, 2),
                 })
@@ -1023,7 +1030,7 @@ def compute_backtest_run(loaded_sessions, params):
                 sync_df, params['z_thresh'], params['regime'],
                 params['theta_exit'], params['vel_exit'],
                 params['max_ticks'], params['hysteresis'],
-                current_equity, params['slippage']
+                current_equity, params['commission_pct']
             )
             events = find_regime_flip_events(sync_df, params['z_thresh'], params['regime'])
 
@@ -1544,9 +1551,10 @@ one-line explanation.
             help="Starting account size used to size every position (100% of current equity per trade)."
         )
     with po2:
-        bt_slippage = st.number_input(
-            "Slippage / Share ($)", 0.0, 0.1, 0.005, step=0.001, format="%.3f", key="bt_slippage",
-            help="Estimated cost per share paid on both entry and exit, deducted from every trade's P&L."
+        bt_commission_pct = st.number_input(
+            "Broker Commission (% per side)", 0.0, 5.0, 0.05, step=0.01, format="%.2f", key="bt_commission_pct",
+            help="Charged on both entry and exit notional (e.g. 0.05% per side = 0.10% round trip). "
+                 "Shown separately as Gross P&L, Commission, and Net P&L in the trade log."
         )
 
     st.markdown("---")
@@ -1583,7 +1591,7 @@ one-line explanation.
             'core_ticks': bt_core_ticks, 'deep_ticks': bt_deep_ticks,
             'theta_exit': bt_theta_exit, 'vel_exit': bt_vel_exit,
             'max_ticks': bt_max_ticks, 'hysteresis': bt_hysteresis,
-            'capital': bt_capital, 'slippage': bt_slippage,
+            'capital': bt_capital, 'commission_pct': bt_commission_pct,
         }
         params_key = (tuple(sorted(params.items())), tuple(sorted(loaded_sessions.keys())))
 
